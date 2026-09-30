@@ -27,3 +27,5 @@ services:
         value: "true"
       - key: REPORT_HOUR
         value: "9"
+      - key: KEEP_ALIVE_ENABLED
+        value: "true"

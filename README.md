@@ -2,7 +2,7 @@
 
 Automatically assign uploaded videos to editors, track delivery, notify admins when a deadline is missed, and post weekly performance charts.
 
-**Render deployment:** follow [RENDER_SETUP.md](RENDER_SETUP.md). Free Render needs an external Postgres database and external uptime monitoring; uninterrupted operation cannot be guaranteed on the free plan.
+**Render deployment:** follow [RENDER_SETUP.md](RENDER_SETUP.md). Free Render needs an external Postgres database. Built-in five-minute self-ping helps keep it active, and an external uptime monitor is recommended for wake-up and outage alerts; uninterrupted operation cannot be guaranteed on the free plan.
 
 **Status:** built and tested locally with simulated Telegram responses. A real bot token, two groups, and an always-on computer/server are required to go live. No Telegram messages have been sent during development.
 

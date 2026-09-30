@@ -4,7 +4,9 @@
 
 Render free web services sleep after **15 minutes without inbound requests**. Outgoing Telegram polling is not inbound traffic. The application cannot disable this platform rule.
 
-An external uptime monitor requesting `/health` every **5 minutes** supplies regular inbound traffic and can reduce idle spin-down. This is best-effort: monitor outages, Render restarts, traffic restrictions, and free-plan quota limits can still interrupt the bot. It is not a 24/7 guarantee. Render's internal deployment health checks are not a substitute for an external monitor. Do not monitor `/robots.txt`, which Render can answer without waking the service.
+The bot includes the same **self-ping approach used in Kutty bot**: it requests its own public `/health` URL every **5 minutes**, starting shortly after startup. It reads Render's automatic `RENDER_EXTERNAL_URL`; no URL entry is normally needed. Set `KEEP_ALIVE_ENABLED=false` to disable it. `APP_URL` is an optional fallback public HTTPS service origin.
+
+This is best-effort and only runs while the process is alive. It can help supply inbound traffic, but it cannot wake a service that has already stopped. An external uptime monitor requesting `/health` every five minutes is still recommended for wake-up and failure notifications. Monitor outages, Render restarts, traffic restrictions, and free-plan quota limits can interrupt either approach. Neither is a 24/7 guarantee. Render's internal deployment health checks are not a substitute for an external monitor. Do not monitor `/robots.txt`, which Render can answer without waking the service.
 
 The free allowance is **750 instance hours per workspace per month**, shared across services. A continuously running bot can use almost all of that. Free services can restart at any time.
 
@@ -72,7 +74,7 @@ In an external HTTP uptime-monitoring service that supports five-minute checks:
 - Expected status: 200
 - Enable failure notifications to yourself.
 
-You need to create this monitor after Render gives you the service URL. The code does not create a monitor or guarantee that the provider will never suspend the service. Do not run a self-ping loop: a sleeping process cannot wake itself.
+You can create this additional monitor after Render gives you the service URL. Built-in self-ping is already enabled; the code does not create an external monitor or guarantee that the provider will never suspend the service. A sleeping process cannot wake itself.
 
 ## 5. Verify
 

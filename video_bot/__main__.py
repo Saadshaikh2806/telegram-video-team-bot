@@ -11,6 +11,7 @@ from .runner import Runner
 from .store import Store
 from .telegram import Telegram, TelegramError
 from .health import Health
+from .keepalive import start_keepalive
 
 
 def main():
@@ -46,6 +47,8 @@ def main():
         health.start(int(os.environ['PORT']))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    if health.server:
+        start_keepalive(stop)
     print('Bot is running. In Telegram, send /whoami or /help. Press Ctrl+C to stop.')
     if not config.admins:
         print('ADMIN_IDS is empty. Use /whoami, add your ID to .env, then restart.')
@@ -54,6 +57,7 @@ def main():
     except KeyboardInterrupt:
         print('\nBot stopped. Jobs and deadlines are saved.')
     finally:
+        stop.set()
         try:
             store.release_lease()
         finally:
