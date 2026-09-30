@@ -12,6 +12,7 @@ from .store import Store
 from .telegram import Telegram, TelegramError
 from .health import Health
 from .keepalive import start_keepalive
+from .database_errors import database_error_hint
 
 
 def main():
@@ -40,8 +41,8 @@ def main():
         raise SystemExit(f'Telegram connection failed (code {exc.code}); check token and group access.') from None
     try:
         store = Store(config.database, config.database_url)
-    except Exception:
-        raise SystemExit('Could not open the database. Check DATABASE_URL, network access, and database availability. Credentials have not been logged.') from None
+    except Exception as exc:
+        raise SystemExit('Could not open the database. ' + database_error_hint(exc, config.database_url) + ' Credentials have not been logged.') from None
     health = Health()
     if os.getenv('PORT'):
         health.start(int(os.environ['PORT']))
