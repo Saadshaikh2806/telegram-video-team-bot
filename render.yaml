@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: video-team-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m video_bot
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: TIMEZONE
+        value: Asia/Kolkata
+      - key: ASSIGNMENT_MODE
+        value: effort
+      - key: MAX_ACTIVE_JOBS
+        value: "2"
+      - key: DEADLINE_HOURS
+        value: "24"
+      - key: REQUIRE_APPROVAL
+        value: "true"
+      - key: REPORT_HOUR
+        value: "9"

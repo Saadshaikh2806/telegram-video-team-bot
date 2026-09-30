@@ -1,0 +1,358 @@
+import json
+import os
+import uuid
+import tempfile
+import unittest
+from unittest.mock import patch
+from pathlib import Path
+
+from video_bot.config import Config
+from video_bot.engine import Engine
+from video_bot.runner import Runner
+from video_bot.store import Store
+from video_bot.telegram import TelegramError
+
+
+class FakeTelegram:
+    def __init__(self):
+        self.calls = []
+        self.failure = None
+
+    def call(self, method, **params):
+        if self.failure:
+            raise self.failure
+        self.calls.append((method, params))
+        return {'message_id': 1000 + len(self.calls)}
+
+
+class BotTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1790748000.0
+        self.config = Config(admins=(99,), uploaders=-1001, editors=-1002, timezone='UTC', max_active=100)
+        self.pg_cleanup = None
+        url = os.getenv('TEST_DATABASE_URL', '')
+        if url:
+            import psycopg
+            from psycopg.conninfo import make_conninfo
+            from psycopg import sql
+            schema = 'test_' + uuid.uuid4().hex
+            admin = psycopg.connect(url, autocommit=True)
+            admin.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
+            self.pg_cleanup = (admin, schema)
+            url = make_conninfo(url, options=f'-c search_path={schema}')
+        self.store = Store(':memory:', url)
+        self.e = Engine(self.config, self.store, lambda: self.now)
+        self.db = self.store.db
+        self.api = FakeTelegram()
+        self.r = Runner(self.e, self.api)
+        self.seq = 0
+
+    def tearDown(self):
+        self.db.close()
+        if self.pg_cleanup:
+            from psycopg import sql
+            admin, schema = self.pg_cleanup
+            admin.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(schema)))
+            admin.close()
+
+    def message(self, uid, text='', chat=-1002, **fields):
+        self.seq += 1
+        msg = dict(message_id=self.seq, date=int(self.now), chat={'id': chat, 'type': 'supergroup'},
+                   text=text, **{'from': {'id': uid, 'first_name': f'Editor {uid}'}})
+        msg.update(fields)
+        self.e.handle({'update_id': self.seq, 'message': msg})
+        return msg
+
+    def add(self, uid):
+        self.message(99, '/add_editor', reply_to_message={'from': {'id': uid, 'first_name': f'Editor {uid}'}})
+
+    def upload(self, effort=2, key=None):
+        return self.message(50, chat=-1001, text='', caption=f'Add captions #effort{effort}',
+            video={'file_unique_id': key or f'file-{self.seq}'})
+
+    def deliver(self, jid):
+        job = self.e.job(jid)
+        with self.db:
+            self.e.assignment_delivered(jid, jid + 1000, self.now, self.now + 86400)
+
+    def test_equal_effort_balances_within_largest_job(self):
+        for uid in (1, 2, 3):
+            self.add(uid)
+        for effort in [3, 1, 2, 3, 1, 1, 2, 3, 2, 1, 2, 3]:
+            self.upload(effort)
+        loads = [r[0] for r in self.db.execute('SELECT fair_load FROM editors')]
+        self.assertLessEqual(max(loads) - min(loads), 3)
+        self.assertEqual(sum(loads), 24)
+        self.assertEqual(self.e.job(1)['effort'], 3)
+        self.assertEqual(self.e.job(2)['effort'], 1)
+
+    def test_rotation_equal_counts(self):
+        self.config.mode = 'rotation'
+        for uid in (1, 2, 3):
+            self.add(uid)
+        for effort in [1, 3, 2, 3, 2, 1]:
+            self.upload(effort)
+        counts = [r[0] for r in self.db.execute('SELECT COUNT(*) FROM jobs GROUP BY editor_id')]
+        self.assertEqual(counts, [2, 2, 2])
+
+    def test_capacity_and_leave(self):
+        self.config.max_active = 1
+        self.add(1)
+        self.add(2)
+        self.message(99, '/availability 2 off')
+        self.upload()
+        self.upload()
+        self.assertEqual(self.e.job(2)['status'], 'queued')
+        self.message(99, '/availability 2 on')
+        self.assertEqual(self.e.job(2)['editor_id'], 2)
+
+    def test_duplicate_update_and_file(self):
+        self.add(1)
+        msg = self.upload(key='same')
+        self.e.handle({'update_id': self.seq, 'message': msg})
+        self.upload(key='same')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+
+    def test_deadline_starts_on_delivery(self):
+        self.add(1)
+        self.upload()
+        self.now += 90000
+        self.e.tick()
+        self.assertIsNone(self.e.job(1)['due'])
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.r.deliver(row, {})
+        self.assertEqual(self.e.job(1)['due'], self.now + 86400)
+        self.assertEqual(self.api.calls[-1][0], 'copyMessage')
+
+    def test_link_assignment_contains_brief_and_source(self):
+        self.add(1)
+        self.message(50, '/new https://example.org/source Add subtitles #effort3', chat=-1001)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.r.deliver(row, {})
+        method, params = self.api.calls[-1]
+        self.assertEqual(method, 'sendMessage')
+        self.assertIn('https://example.org/source', params['text'])
+        self.assertIn('VID-0001', params['text'])
+
+    def test_24_hour_alert_once_and_no_early_escalation(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.now += 18 * 3600
+        self.e.tick()
+        self.e.tick()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe LIKE 'alert:%:6h'").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe LIKE '%:overdue'").fetchone()[0], 0)
+        self.now += 6 * 3600
+        self.e.tick()
+        self.e.tick()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe LIKE '%:overdue'").fetchone()[0], 1)
+
+    def test_submission_stops_stale_alert_and_admin_wait_not_late(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        deadline = self.e.job(1)['due']
+        self.now += 86401
+        self.e.tick()
+        self.message(1, '/submit 1 https://example.org/edit', date=int(deadline - 10))
+        row = self.db.execute("SELECT * FROM outbox WHERE dedupe LIKE '%:overdue'").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        self.assertEqual(self.db.execute('SELECT state FROM outbox WHERE id=?', (row['id'],)).fetchone()[0], 'skipped')
+        self.now += 90000
+        self.message(99, '/approve 1')
+        rows = self.e.report_rows(deadline - 1, deadline + 1)
+        self.assertEqual(rows[0]['on_time_pct'], 100)
+
+    def test_authorization_for_submit_approve_and_availability(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(2, '/submit 1 https://example.org/edit')
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+        self.message(1, '/submit 1 https://example.org/edit')
+        self.message(1, '/approve 1')
+        self.assertEqual(self.e.job(1)['status'], 'submitted')
+        self.message(1, '/availability 1 off')
+        self.assertEqual(self.db.execute('SELECT available FROM editors WHERE id=1').fetchone()[0], 1)
+        self.message(99, '/approve 1')
+        self.assertEqual(self.e.job(1)['status'], 'approved')
+
+    def test_unsubmitted_overdue_in_report_denominator(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        due = self.e.job(1)['due']
+        self.now = due + 100
+        rows = self.e.report_rows(due - 1, due + 1)
+        self.assertEqual((rows[0]['due'], rows[0]['on_time_pct']), (1, 0))
+
+    def test_extension_invalidates_old_alert_and_adjusts_first_deadline(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.now += 86400
+        self.e.tick()
+        old = self.e.job(1)['due']
+        self.message(99, '/extend 1 4 waiting for footage')
+        self.assertEqual(self.e.job(1)['original_due'], old + 14400)
+        row = self.db.execute("SELECT * FROM outbox WHERE dedupe LIKE '%:overdue'").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        self.assertEqual(len(self.api.calls), 0)
+
+    def test_revision_keeps_first_submission_and_tracks_quality(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, '/submit 1 https://example.org/v1')
+        first = self.e.job(1)['first_submitted']
+        self.now += 100
+        self.message(99, '/revise 1 Fix spelling')
+        self.assertEqual(self.e.job(1)['status'], 'revision')
+        self.message(1, '/submit 1 https://example.org/v2')
+        self.message(99, '/approve 1')
+        self.assertEqual(self.e.job(1)['first_submitted'], first)
+        self.assertEqual(self.e.report_rows(first - 1, self.now + 1)[0]['first_pass_pct'], 0)
+
+    def test_auto_approval(self):
+        self.config.approval = False
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, '/submit 1 https://example.org/edit')
+        self.assertEqual(self.e.job(1)['status'], 'approved')
+
+    def test_album_not_split_into_jobs(self):
+        self.add(1)
+        self.message(50, chat=-1001, video={'file_unique_id': 'x'}, media_group_id='album')
+        self.message(50, chat=-1001, video={'file_unique_id': 'y'}, media_group_id='album')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe='album:album'").fetchone()[0], 1)
+
+    def test_weekly_schedule_once_and_restart(self):
+        self.now += 7 * 86400
+        self.e.tick()
+        count = self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='report'").fetchone()[0]
+        self.assertEqual(count, 1)
+        self.e = Engine(self.config, self.store, lambda: self.now)
+        self.e.tick()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='report'").fetchone()[0], count)
+
+    def test_permanent_delivery_failure_keeps_job_without_deadline(self):
+        self.add(1)
+        self.upload()
+        with self.db:
+            self.db.execute("UPDATE outbox SET state='sent' WHERE method!='assignment'")
+        self.api.failure = TelegramError(403)
+        self.r.flush()
+        self.assertIsNone(self.e.job(1)['due'])
+        self.assertEqual(self.db.execute("SELECT state FROM outbox WHERE method='assignment'").fetchone()[0], 'failed')
+
+    def test_persisted_offset_and_jobs_survive_reopen(self):
+        if self.store.remote:
+            self.skipTest('SQLite backup test; Postgres persistence uses external database')
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'test.sqlite3')
+            saved = Store(path)
+            self.db.backup(saved.db)
+            saved.db.close()
+            reopened = Store(path)
+            self.assertEqual(reopened.get('report_cursor'), self.store.get('report_cursor'))
+            recovered = Engine(self.config, reopened, lambda: self.now + 90000)
+            recovered.tick()
+            self.assertEqual(recovered.job(1)['editor_id'], 1)
+            self.assertEqual(reopened.get('offset'), self.store.get('offset'))
+            self.assertEqual(reopened.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe LIKE '%:overdue'").fetchone()[0], 1)
+            reopened.db.close()
+
+    def test_state_and_update_offset_rollback_together(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        before = self.e.job(1)['due']
+        with patch.object(self.store, 'set', side_effect=RuntimeError('simulated disk error')):
+            with self.assertRaises(RuntimeError):
+                self.message(99, '/extend 1 4 waiting for footage')
+        self.assertEqual(self.e.job(1)['due'], before)
+        self.assertIsNone(self.db.execute('SELECT 1 FROM processed_updates WHERE id=?', (self.seq,)).fetchone())
+
+    def test_reply_submission_and_callback_permissions(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, video={'file_unique_id': 'finished'}, reply_to_message={'message_id': 1001})
+        self.assertEqual(self.e.job(1)['status'], 'submitted')
+        for uid, expected in [(2, 'submitted'), (99, 'approved')]:
+            self.seq += 1
+            self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'cb{uid}', 'from': {'id': uid},
+                'data': 'approve:1', 'message': {'message_id': 500, 'chat': {'id': -1002}}}})
+            self.assertEqual(self.e.job(1)['status'], expected)
+
+    def test_rate_limit_retries_without_starting_clock(self):
+        self.add(1)
+        self.upload()
+        with self.db:
+            self.db.execute("UPDATE outbox SET state='sent' WHERE method!='assignment'")
+        self.api.failure = TelegramError(429, 30)
+        self.r.flush()
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.assertEqual(row['state'], 'pending')
+        self.assertEqual(row['available_at'], self.now + 30)
+        self.assertIsNone(self.e.job(1)['due'])
+        self.now += 31
+        self.api.failure = None
+        self.r.flush()
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+
+    def test_report_generates_png_csv_and_publication_queue(self):
+        from video_bot.reports import build_report
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        rows = self.e.report_rows(self.now - 1, self.now + 86401)
+        with tempfile.TemporaryDirectory() as directory:
+            images, csv = build_report(rows, 'Test week', directory, 'test')
+            self.assertTrue(csv.exists())
+            self.assertEqual(images[0].read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+
+    def test_cancelled_reservation_releases_capacity_and_allocation(self):
+        self.config.max_active = 1
+        self.add(1)
+        self.upload(3)
+        self.upload(1)
+        self.message(99, '/cancel 1 wrong upload')
+        self.assertEqual(self.e.job(1)['status'], 'cancelled')
+        self.assertEqual(self.e.job(2)['status'], 'dispatching')
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=1').fetchone()[0], 1)
+
+    def test_join_requires_admin_approval(self):
+        self.message(7, '/join')
+        self.assertIsNone(self.db.execute('SELECT * FROM editors WHERE id=7').fetchone())
+        for actor, expected in [(7, 0), (99, 1)]:
+            self.seq += 1
+            self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'join{actor}',
+                'from': {'id': actor}, 'data': 'add_editor:7',
+                'message': {'message_id': 88, 'chat': {'id': -1002}}}})
+            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors WHERE id=7').fetchone()[0], expected)
+
+    def test_join_id_registration_requires_known_request(self):
+        self.message(99, '/add_editor 7')
+        self.assertIsNone(self.db.execute('SELECT * FROM editors WHERE id=7').fetchone())
+        self.message(7, '/join', chat=-1001)
+        self.assertIsNone(self.store.get('editor_request:7'))
+        self.message(7, '/join')
+        self.message(99, '/add_editor 7')
+        self.assertEqual(self.db.execute('SELECT name FROM editors WHERE id=7').fetchone()[0], 'Editor 7')
+
+    def test_missing_reply_identity_gives_join_instructions(self):
+        self.message(99, '/add_editor', external_reply={'origin': {'type': 'hidden_user', 'sender_user_name': 'Saniya'}})
+        payload = json.loads(self.db.execute('SELECT payload FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0])
+        self.assertIn('/join', payload['text'])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
