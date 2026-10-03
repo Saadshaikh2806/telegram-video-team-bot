@@ -353,6 +353,30 @@ class BotTests(unittest.TestCase):
         self.assertIn('/join', payload['text'])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 0)
 
+    def test_admin_can_correct_wrong_group_binding_before_jobs(self):
+        self.add(1)
+        self.message(99, '/unbind_editors')
+        self.message(99, '/unbind_uploaders', chat=-1001)
+        self.message(99, '/bind_editors', chat=-1001)
+        self.message(99, '/bind_uploaders', chat=-1002)
+        self.assertEqual(self.e.editors_chat, -1001)
+        self.assertEqual(self.e.uploaders, -1002)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
+
+    def test_unbind_requires_admin_and_current_group_and_no_jobs(self):
+        self.message(1, '/unbind_uploaders', chat=-1001)
+        self.message(99, '/unbind_uploaders', chat=-1002)
+        self.assertEqual(self.e.uploaders, -1001)
+        self.add(1)
+        self.upload()
+        self.message(99, '/unbind_uploaders', chat=-1001)
+        self.assertEqual(self.e.uploaders, -1001)
+
+    def test_unbinding_not_undone_by_restart_configuration(self):
+        self.message(99, '/unbind_uploaders', chat=-1001)
+        restarted = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(restarted.uploaders, 0)
+
 
 if __name__ == '__main__':
     unittest.main()

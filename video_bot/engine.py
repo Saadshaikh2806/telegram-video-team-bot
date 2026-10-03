@@ -24,6 +24,7 @@ Or reply to the assignment video with your edited video/document; /submit 12 in 
 
 Admins:
 /bind_uploaders and /bind_editors — run inside the two groups
+/unbind_uploaders and /unbind_editors — undo a binding before any jobs exist
 /add_editor — reply to an editor's message, or /add_editor USER_ID after they send /join
 /availability USER_ID on|off
 /editors — roster and assigned workload
@@ -56,7 +57,7 @@ class Engine:
         self.db = store.db
         with self.db:
             for key, value in [('uploaders', config.uploaders), ('editors_chat', config.editors)]:
-                if value and not self.s.get(key):
+                if value and self.s.get(key) is None:
                     self.s.set(key, value)
             if self.s.get('report_cursor') is None:
                 self.s.set('report_cursor', self.previous_week()[1])
@@ -137,6 +138,20 @@ class Engine:
         if text.split('@')[0] in ('/help', '/start'):
             self.say(chat, HELP)
             return
+        if text.startswith('/unbind_'):
+            self.admin_only(uid)
+            command = text.split()[0].split('@')[0]
+            if command not in ('/unbind_uploaders', '/unbind_editors'):
+                raise UserError('Use /unbind_uploaders or /unbind_editors.')
+            key = 'uploaders' if command == '/unbind_uploaders' else 'editors_chat'
+            if not self.s.get(key) or self.s.get(key) != chat:
+                raise UserError('Run this command inside the group currently assigned that role.')
+            if self.db.execute('SELECT 1 FROM jobs LIMIT 1').fetchone():
+                raise UserError('Jobs already exist, so this setup correction cannot change the groups. Existing assignments need a planned group migration.')
+            self.s.set(key, 0)
+            self.s.event(None, uid, command[1:], str(chat), self.clock())
+            self.say(chat, 'Group role removed. Now send /bind_editors in Video Editors and /bind_uploaders in Video Uploaders. Editor registrations are preserved.')
+            return
         if text.startswith('/bind_'):
             self.admin_only(uid)
             command = text.split()[0].split('@')[0]
@@ -147,7 +162,7 @@ class Engine:
             if chat == other:
                 raise UserError('Uploaders and editors must use different groups.')
             if self.s.get(key) and self.s.get(key) != chat:
-                raise UserError('This group is already bound elsewhere. Stop the bot and update its database settings before migrating groups.')
+                raise UserError('That role is already assigned to another group. Before any jobs exist, use /unbind_uploaders or /unbind_editors in the incorrectly connected group, then bind the correct group.')
             self.s.set(key, chat)
             self.say(chat, 'Group connected. Send /help for commands.')
             return

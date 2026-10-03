@@ -79,6 +79,7 @@ The sample in `reports/sample-performance-1.png` uses fictional data and does no
 | `/whoami` | Anyone | Show their own user ID and current chat ID |
 | `/help` | Anyone | Show commands |
 | `/bind_uploaders`, `/bind_editors` | Admin | Connect the two groups |
+| `/unbind_uploaders`, `/unbind_editors` | Admin | Undo an incorrect binding inside that group before any jobs exist; editor registrations are preserved |
 | `/add_editor` as a reply | Admin | Register an editor |
 | `/join` | Editor | Request registration, with an admin approval button |
 | `/add_editor USER_ID` | Admin | Approve someone who already sent `/join` |
