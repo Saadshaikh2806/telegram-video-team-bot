@@ -127,6 +127,12 @@ class Engine:
 
     def message(self, msg):
         chat = msg['chat']['id']
+        if msg.get('migrate_to_chat_id'):
+            self.migrate_chat(chat, msg['migrate_to_chat_id'])
+            return
+        if msg.get('migrate_from_chat_id'):
+            self.migrate_chat(msg['migrate_from_chat_id'], chat)
+            return
         user = msg.get('from', {})
         uid = user.get('id', 0)
         text = (msg.get('text') or msg.get('caption', '')).strip()
@@ -180,6 +186,34 @@ class Engine:
             job = self.db.execute('SELECT * FROM jobs WHERE card_id=?', (reply_id,)).fetchone()
             if job:
                 self.submit(job, uid, msg, self.link(text))
+
+    def migrate_chat(self, old, new):
+        """Apply Telegram-confirmed migration within the caller's transaction."""
+        if old == new or not isinstance(new, int) or new >= 0:
+            return False
+        keys = [key for key in ('uploaders', 'editors_chat') if self.s.get(key) == old]
+        if not keys:
+            return False
+        for key in keys:
+            self.s.set(key, new)
+        self.db.execute('UPDATE jobs SET source_chat=? WHERE source_chat=?', (new, old))
+        self.db.execute('UPDATE jobs SET submission_chat=? WHERE submission_chat=?', (new, old))
+        for row in self.db.execute("SELECT * FROM outbox WHERE state IN ('pending','failed')").fetchall():
+            payload = json.loads(row['payload'])
+            changed = False
+            for field in ('chat_id', 'from_chat_id'):
+                if payload.get(field) == old:
+                    payload[field] = new
+                    changed = True
+            reply = payload.get('reply_parameters', {})
+            if reply.get('chat_id') == old:
+                reply['chat_id'] = new
+                changed = True
+            if changed or row['method'] == 'assignment':
+                self.db.execute("UPDATE outbox SET payload=?,state='pending',available_at=0,attempts=0,last_error=NULL WHERE id=?",
+                                (json.dumps(payload), row['id']))
+        self.s.event(None, None, 'group_migrated', f'{old} -> {new}', self.clock())
+        return True
 
     @staticmethod
     def link(text):

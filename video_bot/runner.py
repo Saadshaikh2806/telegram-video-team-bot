@@ -16,6 +16,25 @@ class Runner:
     def __init__(self, engine, api):
         self.e, self.api = engine, api
         self.chat_next = {}
+        self.groups_checked = False
+
+    def reconcile_groups(self):
+        # Recover upgrades whose service messages arrived before this version.
+        for chat in (self.e.uploaders, self.e.editors_chat):
+            if not chat:
+                continue
+            try:
+                result = self.api.call('getChat', chat_id=chat)
+                new = result.get('id', chat)
+            except TelegramError as exc:
+                if not exc.migrate_to_chat_id:
+                    raise
+                new = exc.migrate_to_chat_id
+            if new != chat:
+                with self.e.db:
+                    self.e.migrate_chat(chat, new)
+                log.info('Recovered upgraded group binding; affected deliveries requeued')
+        self.groups_checked = True
 
     def flush(self, limit=15):
         now = self.e.clock()
@@ -36,6 +55,12 @@ class Runner:
                 if chat:
                     self.chat_next[chat] = self.e.clock() + 3.1
             except TelegramError as exc:
+                if exc.migrate_to_chat_id and chat:
+                    with self.e.db:
+                        migrated = self.e.migrate_chat(chat, exc.migrate_to_chat_id)
+                    if migrated:
+                        log.info('Updated upgraded group binding; affected deliveries will retry')
+                        break  # Reload payloads instead of sending stale queued chat IDs.
                 permanent = exc.code in (400, 401, 403, 404)
                 attempts = row['attempts'] + 1
                 delay = max(exc.retry_after, min(300, 2 ** min(attempts, 8)))
@@ -106,6 +131,8 @@ class Runner:
                         health.beat()
                     stop.wait(5)
                     continue
+                if not self.groups_checked:
+                    self.reconcile_groups()
                 pending = self.e.db.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone()
                 updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=2 if pending else 20,
                                         allowed_updates=['message', 'callback_query'])

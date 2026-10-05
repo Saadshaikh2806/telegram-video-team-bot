@@ -34,9 +34,6 @@ def main():
         api.call('getMe')
         if api.call('getWebhookInfo').get('url'):
             raise SystemExit('This bot has a webhook. Use a separate bot or remove its webhook before starting this polling bot.')
-        for chat in (config.uploaders, config.editors):
-            if chat:
-                api.call('getChat', chat_id=chat)
     except TelegramError as exc:
         raise SystemExit(f'Telegram connection failed (code {exc.code}); check token and group access.') from None
     try:

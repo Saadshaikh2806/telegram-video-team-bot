@@ -377,6 +377,48 @@ class BotTests(unittest.TestCase):
         restarted = Engine(self.config, self.store, lambda: self.now)
         self.assertEqual(restarted.uploaders, 0)
 
+    def test_group_service_migration_preserves_jobs_and_retargets_queue(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        due = self.e.job(1)['due']
+        self.message(1, '/submit 1 https://example.org/edit')
+        with self.db:
+            self.store.enqueue('sendMessage', {'chat_id': -1002, 'text': 'Test'})
+            self.db.execute("UPDATE outbox SET state='failed' WHERE method='sendMessage'")
+        self.message(0, migrate_to_chat_id=-100999, **{'from': {'id': 0, 'is_bot': True}})
+        self.assertEqual(self.e.editors_chat, -100999)
+        self.assertEqual(self.e.job(1)['submission_chat'], -100999)
+        self.assertEqual(self.e.job(1)['due'], due)
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
+        for row in self.db.execute("SELECT payload FROM outbox WHERE state='pending'").fetchall():
+            self.assertNotEqual(json.loads(row[0]).get('chat_id'), -1002)
+
+    def test_api_migration_requeues_failed_delivery_and_retries(self):
+        with self.db:
+            self.store.enqueue('sendMessage', {'chat_id': -1002, 'text': 'Test'})
+        self.api.failure = TelegramError(400, description='upgraded to a supergroup', migrate_to_chat_id=-100999)
+        self.r.flush()
+        self.assertEqual(self.e.editors_chat, -100999)
+        self.assertEqual(self.db.execute('SELECT state FROM outbox').fetchone()[0], 'pending')
+        self.api.failure = None
+        self.r.flush()
+        self.assertEqual(self.api.calls[-1][1]['chat_id'], -100999)
+
+    def test_startup_recovers_previously_missed_migration(self):
+        self.add(1)
+        self.upload()
+        original = self.api.call
+        def call(method, **payload):
+            if method == 'getChat' and payload['chat_id'] == -1001:
+                raise TelegramError(400, migrate_to_chat_id=-100888)
+            return original(method, **payload)
+        self.api.call = call
+        self.r.reconcile_groups()
+        self.assertEqual(self.e.uploaders, -100888)
+        self.assertEqual(self.e.job(1)['source_chat'], -100888)
+        self.assertTrue(self.r.groups_checked)
+
 
 if __name__ == '__main__':
     unittest.main()

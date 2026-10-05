@@ -8,8 +8,9 @@ from urllib.request import Request, urlopen
 
 
 class TelegramError(Exception):
-    def __init__(self, code, retry_after=0, description=''):
+    def __init__(self, code, retry_after=0, description='', migrate_to_chat_id=None):
         self.code, self.retry_after = code, retry_after
+        self.migrate_to_chat_id = migrate_to_chat_id
         self.reason = safe_error_reason(description)
         super().__init__(f'Telegram request failed (code {code}): {self.reason}')
 
@@ -75,5 +76,6 @@ class Telegram:
         except (URLError, TimeoutError, OSError):
             raise TelegramError(0) from None
         if not result.get('ok'):
-            raise TelegramError(result.get('error_code', 0), result.get('parameters', {}).get('retry_after', 0), result.get('description', ''))
+            params = result.get('parameters', {})
+            raise TelegramError(result.get('error_code', 0), params.get('retry_after', 0), result.get('description', ''), params.get('migrate_to_chat_id'))
         return result['result']
