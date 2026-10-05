@@ -1,4 +1,5 @@
 import os
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +28,7 @@ class Config:
     report_hour: int = 9
     database: str = 'data/bot.sqlite3'
     database_url: str = ''
+    team_groups: dict = field(default_factory=dict)
 
     @property
     def tz(self):
@@ -36,6 +38,7 @@ class Config:
     def from_env(cls):
         load_env()
         c = cls(
+            team_groups=json.loads(Path(__file__).with_name('team_groups.json').read_text(encoding='utf-8')),
             token=os.getenv('TELEGRAM_BOT_TOKEN', '').strip(),
             admins=tuple(int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()),
             uploaders=int(os.getenv('UPLOADERS_CHAT_ID') or 0),

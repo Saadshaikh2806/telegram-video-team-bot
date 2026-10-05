@@ -15,7 +15,7 @@ Dependencies are already installed in `.venv` on this computer.
 3. If you do not know your numeric Telegram user ID, leave admin IDs blank. Start the bot and send it `/whoami` in a private chat. Stop it with Ctrl+C, open **Configure Bot.cmd**, add your number to the admin IDs field, save, then start it again. Separate multiple admin IDs with commas.
 4. Create the **Video Uploaders** and **Video Editors** groups, or use your existing groups. Add the bot to both. Make it an administrator so it can receive ordinary uploads and replies. Allow it to send messages, videos, photos, and documents. It does not need permission to delete messages or manage members.
 5. From your personal Telegram account listed in `ADMIN_IDS`, send `/bind_uploaders` inside the Uploaders group and `/bind_editors` inside the Editors group. Anonymous admin messages are not accepted for administrative actions.
-6. Ask each editor to send `/join` in the Editors group from their personal account. Tap **Approve** on the bot's request message. Only configured admins can approve. Alternatively, reply to an editor's ordinary message with `/add_editor`; if Telegram omits their identity from the reply, use `/join` instead. Only explicitly registered editors receive assignments.
+6. Anyone joining the Editors group is automatically registered, except bots. Existing group members should send one normal message (for example, Hi) so the bot can identify them. No registration approval is needed. The bot must be a group administrator to receive membership updates.
 7. Upload a short test video in Uploaders with the caption `Add English captions #effort1`. Check that it arrives with the assigned editor and deadline in Editors.
 8. Have that editor reply to the assignment with an edited video, then have an admin approve it. Check that the approved result appears in Uploaders.
 
@@ -80,9 +80,6 @@ The sample in `reports/sample-performance-1.png` uses fictional data and does no
 | `/help` | Anyone | Show commands |
 | `/bind_uploaders`, `/bind_editors` | Admin | Connect the two groups |
 | `/unbind_uploaders`, `/unbind_editors` | Admin | Undo an incorrect binding inside that group before any jobs exist; editor registrations are preserved |
-| `/add_editor` as a reply | Admin | Register an editor |
-| `/join` | Editor | Request registration, with an admin approval button |
-| `/add_editor USER_ID` | Admin | Approve someone who already sent `/join` |
 | `/availability 12345 off` or `on` | Admin | Pause/resume new assignments |
 | `/myjobs` | Editor | Show latest 30 open assignments |
 | `/job 12` | Group member | Show a job |
@@ -124,7 +121,7 @@ Telegram keeps pending bot updates for at most 24 hours. Downtime beyond that ca
 
 Large videos are copied within Telegram rather than downloaded by this application, avoiding the standard `getFile` download limit. Protected content, deleted source messages, group permissions, or platform restrictions can still prevent delivery. Use a source link if copying is unavailable.
 
-Current scope: one uploader group and one editor group, text/link/video jobs, manual availability, approval and revisions. Automatic reassignment, forum-topic creation, review-SLA reminders, holiday calendars, skill-based routing, and a web dashboard are not included in this version. Removing someone from Telegram does not automatically remove them from the roster; set availability off first.
+Current scope: one uploader group and one editor group, text/link/video jobs, manual availability, approval and revisions. Automatic reassignment, forum-topic creation, review-SLA reminders, holiday calendars, skill-based routing, and a web dashboard are not included in this version. Leaving or being removed from the Editors group disables new assignments when Telegram delivers the membership update. Existing jobs remain recorded. An admin pause is preserved when an editor sends messages.
 
 ## Development and verification
 
@@ -137,3 +134,9 @@ Current scope: one uploader group and one editor group, text/link/video jobs, ma
 The configuration check requires a token in `.env` but makes no network calls. Automated tests use a fake Telegram client and do not send real messages. Live group permissions, delivery, and mentions must be checked during the initial test job.
 
 Official references: [Telegram Bot API](https://core.telegram.org/bots/api) and [Bots FAQ](https://core.telegram.org/bots/faq).
+
+## Team group connections
+
+The owner-confirmed group IDs are in `video_bot/team_groups.json`: Editors `-1004430488373`, Uploaders `-1004411321528`. A change to this file corrects saved bindings once on startup, preserving later Telegram migration updates. These IDs are not credentials. No Render environment changes are needed for these two groups.
+
+Telegram does not provide a bot API to list all existing members. Existing editors must send a normal message once; future joins are automatic while the bot is an administrator and receiving updates. Human administrators who join or send a normal message are included too; use `/availability USER_ID off` for admins who do not edit.

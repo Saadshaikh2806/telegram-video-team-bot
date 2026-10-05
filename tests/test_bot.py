@@ -64,7 +64,7 @@ class BotTests(unittest.TestCase):
         return msg
 
     def add(self, uid):
-        self.message(99, '/add_editor', reply_to_message={'from': {'id': uid, 'first_name': f'Editor {uid}'}})
+        self.message(uid, 'Hi')
 
     def upload(self, effort=2, key=None):
         return self.message(50, chat=-1001, text='', caption=f'Add captions #effort{effort}',
@@ -328,30 +328,45 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.e.job(2)['status'], 'dispatching')
         self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=1').fetchone()[0], 1)
 
-    def test_join_requires_admin_approval(self):
-        self.message(7, '/join')
-        self.assertIsNone(self.db.execute('SELECT * FROM editors WHERE id=7').fetchone())
-        for actor, expected in [(7, 0), (99, 1)]:
-            self.seq += 1
-            self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'join{actor}',
-                'from': {'id': actor}, 'data': 'add_editor:7',
-                'message': {'message_id': 88, 'chat': {'id': -1002}}}})
-            self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors WHERE id=7').fetchone()[0], expected)
+    def test_members_join_without_approval_and_bots_are_excluded(self):
+        self.message(99, new_chat_members=[{'id': 7, 'first_name': 'Editor'}, {'id': 8, 'is_bot': True}])
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
+        self.assertIsNotNone(self.db.execute('SELECT 1 FROM editors WHERE id=7').fetchone())
 
-    def test_join_id_registration_requires_known_request(self):
-        self.message(99, '/add_editor 7')
-        self.assertIsNone(self.db.execute('SELECT * FROM editors WHERE id=7').fetchone())
-        self.message(7, '/join', chat=-1001)
-        self.assertIsNone(self.store.get('editor_request:7'))
-        self.message(7, '/join')
-        self.message(99, '/add_editor 7')
-        self.assertEqual(self.db.execute('SELECT name FROM editors WHERE id=7').fetchone()[0], 'Editor 7')
-
-    def test_missing_reply_identity_gives_join_instructions(self):
-        self.message(99, '/add_editor', external_reply={'origin': {'type': 'hidden_user', 'sender_user_name': 'Saniya'}})
-        payload = json.loads(self.db.execute('SELECT payload FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0])
-        self.assertIn('/join', payload['text'])
+    def test_existing_member_registers_on_normal_message_only_in_editors(self):
+        self.message(7, 'Hi', chat=-1001)
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 0)
+        self.message(7, 'Hi')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
+        self.message(7, 'Hi again')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
+
+    def test_leave_disables_new_assignments_and_rejoin_restores(self):
+        self.add(7)
+        self.message(99, left_chat_member={'id': 7})
+        self.assertEqual(self.db.execute('SELECT available FROM editors WHERE id=7').fetchone()[0], 0)
+        self.message(99, new_chat_members=[{'id': 7}])
+        self.assertEqual(self.db.execute('SELECT available FROM editors WHERE id=7').fetchone()[0], 1)
+
+    def test_admin_pause_is_not_undone_by_messages(self):
+        self.add(7)
+        self.message(99, '/availability 7 off')
+        self.message(7, 'Hi')
+        self.assertEqual(self.db.execute('SELECT available FROM editors WHERE id=7').fetchone()[0], 0)
+
+    def test_membership_update_registers_editor(self):
+        self.e.handle({'update_id': 1, 'chat_member': {'chat': {'id': -1002}, 'new_chat_member': {'status': 'member', 'user': {'id': 7, 'first_name': 'Editor'}}}})
+        self.assertIsNotNone(self.db.execute('SELECT 1 FROM editors WHERE id=7').fetchone())
+
+    def test_explicit_group_ids_fix_stale_settings_once(self):
+        self.config.team_groups = {'editors_chat': -1004430488373, 'uploaders': -1004411321528}
+        fixed = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(fixed.editors_chat, -1004430488373)
+        self.assertEqual(fixed.uploaders, -1004411321528)
+        with self.db:
+            self.store.set('editors_chat', -100777)
+        restarted = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(restarted.editors_chat, -100777)
 
     def test_admin_can_correct_wrong_group_binding_before_jobs(self):
         self.add(1)

@@ -20,7 +20,9 @@ class Runner:
 
     def reconcile_groups(self):
         # Recover upgrades whose service messages arrived before this version.
-        for chat in (self.e.uploaders, self.e.editors_chat):
+        chats = [self.e.uploaders, self.e.editors_chat]
+        chats.extend(row[0] for row in self.e.db.execute("SELECT DISTINCT source_chat FROM jobs WHERE status NOT IN ('approved','cancelled')").fetchall())
+        for chat in dict.fromkeys(chats):
             if not chat:
                 continue
             try:
@@ -28,6 +30,9 @@ class Runner:
                 new = result.get('id', chat)
             except TelegramError as exc:
                 if not exc.migrate_to_chat_id:
+                    if exc.code in (400, 403) and chat not in (self.e.uploaders, self.e.editors_chat):
+                        log.warning('An older job source is inaccessible; current group processing will continue')
+                        continue
                     raise
                 new = exc.migrate_to_chat_id
             if new != chat:
@@ -135,7 +140,7 @@ class Runner:
                     self.reconcile_groups()
                 pending = self.e.db.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone()
                 updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=2 if pending else 20,
-                                        allowed_updates=['message', 'callback_query'])
+                                        allowed_updates=['message', 'callback_query', 'chat_member'])
                 for update in updates:
                     self.e.handle(update)
                 self.e.tick()

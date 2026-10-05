@@ -13,7 +13,7 @@ HELP = '''Video team bot
 Uploaders: post a video with an editing brief. Add #effort1, #effort2, or #effort3 (default: 2). One upload = one job; for multi-part footage use /new https://folder-link brief #effort2.
 
 Editors:
-/join — request editor registration; an admin approves with a button
+Group members become editors automatically. Existing members: send a normal message once.
 /whoami — your Telegram ID
 /myjobs — your open work
 /job 12 — job details
@@ -25,7 +25,6 @@ Or reply to the assignment video with your edited video/document; /submit 12 in 
 Admins:
 /bind_uploaders and /bind_editors — run inside the two groups
 /unbind_uploaders and /unbind_editors — undo a binding before any jobs exist
-/add_editor — reply to an editor's message, or /add_editor USER_ID after they send /join
 /availability USER_ID on|off
 /editors — roster and assigned workload
 /jobs — open jobs
@@ -59,6 +58,22 @@ class Engine:
             for key, value in [('uploaders', config.uploaders), ('editors_chat', config.editors)]:
                 if value and self.s.get(key) is None:
                     self.s.set(key, value)
+            # Apply the owner's explicit group correction once, not on every restart.
+            revision = json.dumps(config.team_groups, sort_keys=True)
+            if config.team_groups and self.s.get('team_groups_revision') != revision:
+                destinations = {self.s.get(key): value for key, value in config.team_groups.items()
+                                if key in ('uploaders', 'editors_chat') and self.s.get(key)}
+                for row in self.db.execute("SELECT * FROM outbox WHERE state IN ('pending','failed')").fetchall():
+                    payload = json.loads(row['payload'])
+                    if payload.get('chat_id') in destinations or row['method'] == 'assignment':
+                        if payload.get('chat_id') in destinations:
+                            payload['chat_id'] = destinations[payload['chat_id']]
+                        self.db.execute("UPDATE outbox SET payload=?,state='pending',available_at=0,attempts=0,last_error=NULL WHERE id=?", (json.dumps(payload), row['id']))
+                for key, value in config.team_groups.items():
+                    if key in ('uploaders', 'editors_chat'):
+                        self.s.set(key, value)
+                self.s.set('team_groups_revision', revision)
+                self.s.event(None, None, 'groups_corrected', revision, self.clock())
             if self.s.get('report_cursor') is None:
                 self.s.set('report_cursor', self.previous_week()[1])
 
@@ -110,7 +125,9 @@ class Engine:
             if cb:
                 msg = cb.get('message')
             try:
-                if cb:
+                if update.get('chat_member'):
+                    self.membership(update['chat_member'])
+                elif cb:
                     self.callback(cb)
                 elif msg:
                     self.message(msg)
@@ -136,6 +153,13 @@ class Engine:
         user = msg.get('from', {})
         uid = user.get('id', 0)
         text = (msg.get('text') or msg.get('caption', '')).strip()
+        if chat == self.editors_chat:
+            for member in msg.get('new_chat_members', []):
+                self.auto_editor(member, joined=True)
+            if msg.get('left_chat_member'):
+                self.editor_left(msg['left_chat_member'])
+            if not msg.get('new_chat_members') and not msg.get('left_chat_member') and not msg.get('sender_chat') and (not text.startswith('/') or text.startswith('/whoami')):
+                self.auto_editor(user)
         if text.startswith('/whoami'):
             self.say(chat, f'Your user ID: <code>{uid}</code>\nChat ID: <code>{chat}</code>')
             return
@@ -192,7 +216,8 @@ class Engine:
         if old == new or not isinstance(new, int) or new >= 0:
             return False
         keys = [key for key in ('uploaders', 'editors_chat') if self.s.get(key) == old]
-        if not keys:
+        referenced = self.db.execute('SELECT 1 FROM jobs WHERE source_chat=? OR submission_chat=? LIMIT 1', (old, old)).fetchone()
+        if not keys and not referenced:
             return False
         for key in keys:
             self.s.set(key, new)
@@ -289,11 +314,7 @@ class Engine:
             raise UserError('Use the buttons in the Editors group.')
         action, jid = cb.get('data', '').split(':', 1)
         if action == 'add_editor':
-            self.admin_only(cb['from']['id'])
-            user = self.s.get(f'editor_request:{int(jid)}')
-            if not user:
-                raise UserError('Ask this editor to send /join again in this group.')
-            self.register_editor(user, cb['from']['id'])
+            self.say(self.editors_chat, 'Editor approval is no longer needed. Members register automatically when they join or send a normal message here.')
             return
         job, uid = self.job(int(jid)), cb['from']['id']
         if action == 'start':
@@ -314,35 +335,14 @@ class Engine:
         chat = msg['chat']['id']
         if cmd == '/join':
             if chat != self.editors_chat:
-                raise UserError('Send /join in the Editors group from your personal account.')
-            user = msg['from']
-            if self.db.execute('SELECT 1 FROM editors WHERE id=?', (uid,)).fetchone():
-                self.say(chat, 'You are already registered as an editor.')
-                return
-            self.s.set(f'editor_request:{uid}', user)
-            name = user.get('first_name') or str(uid)
-            self.say(chat, f'{self.admins()}\n{mention(uid, name)} wants to join the editor roster. An admin must approve.',
-                reply_markup={'inline_keyboard': [[{'text': f'Approve {name[:40]}', 'callback_data': f'add_editor:{uid}'}]]})
+                raise UserError('Send a normal message in the Editors group to be registered automatically.')
+            self.auto_editor(msg['from'])
         elif cmd == '/new':
             if chat != self.uploaders or not args or not self.link(args[0]):
                 raise UserError('In Uploaders, send /new https://source-link editing brief #effort2')
             self.create_job(msg, ' '.join(args), args[0])
         elif cmd == '/add_editor':
-            self.admin_only(uid)
-            if chat != self.editors_chat:
-                raise UserError('Add editors from the Editors group.')
-            if args:
-                user = self.s.get(f'editor_request:{int(args[0])}')
-                if not user:
-                    raise UserError('Ask the editor to send /join in this group first, then approve their request.')
-            else:
-                reply = msg.get('reply_to_message', {})
-                user = reply.get('from', {})
-                if reply.get('sender_chat'):
-                    raise UserError('That message was sent as a channel or anonymously. Ask the editor to switch to their personal account and send /join.')
-                if not user:
-                    raise UserError('Telegram did not include the editor\'s identity in this reply. Ask the editor to send /join in this group; then tap Approve on the bot\'s reply.')
-            self.register_editor(user, uid)
+            self.say(chat, 'Manual editor registration is removed. Members register automatically when they join the Editors group or send a normal message there.')
         elif cmd == '/availability':
             self.admin_only(uid)
             eid, state = int(args[0]), args[1].lower()
@@ -366,7 +366,7 @@ class Engine:
             self.admin_only(uid)
             rows = self.db.execute('SELECT * FROM editors ORDER BY id').fetchall()
             if not rows:
-                self.say(chat, 'No editors yet. Reply to their messages with /add_editor.')
+                self.say(chat, 'No editors detected yet. Existing members should send a normal message here once.')
             for offset in range(0, len(rows), 20):
                 self.say(chat, '\n'.join(f'{html.escape(r["name"])} · ID {r["id"]} · {"available" if r["available"] else "away"} · allocation balance {r["fair_load"]}' for r in rows[offset:offset+20]))
         elif cmd == '/report':
@@ -409,15 +409,36 @@ class Engine:
         else:
             raise UserError('Unknown command. Send /help for commands.')
 
-    def register_editor(self, user, actor):
-        self.admin_only(actor)
+    def membership(self, update):
+        if update['chat']['id'] != self.editors_chat:
+            return
+        member = update['new_chat_member']
+        status = member['status']
+        if status in ('member', 'administrator', 'creator') or (status == 'restricted' and member.get('is_member')):
+            self.auto_editor(member['user'], joined=True)
+        else:
+            self.editor_left(member['user'])
+
+    def editor_left(self, user):
         if user.get('is_bot') or not user.get('id'):
-            raise UserError('Only a personal Telegram account can register as an editor. Ask the editor to send /join.')
+            return
+        self.db.execute('UPDATE editors SET available=0 WHERE id=?', (user['id'],))
+        self.s.set(f'editor_left:{user["id"]}', True)
+        self.s.event(None, user['id'], 'editor_left', 'New assignments disabled; existing jobs retained', self.clock())
+
+    def auto_editor(self, user, joined=False):
+        if user.get('is_bot') or not user.get('id'):
+            return
+        existing = self.db.execute('SELECT 1 FROM editors WHERE id=?', (user['id'],)).fetchone()
         name = ' '.join(filter(None, [user.get('first_name'), user.get('last_name')]))[:100] or str(user['id'])
         baseline = self.db.execute('SELECT COALESCE(MIN(fair_load),0) FROM editors WHERE available=1').fetchone()[0]
         self.db.execute('INSERT INTO editors(id,name,fair_load) VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name', (user['id'], name, baseline))
-        self.s.event(None, actor, 'editor_added', str(user['id']), self.clock())
-        self.say(self.editors_chat, f'{mention(user["id"], name)} added to the editor roster.')
+        if joined and self.s.get(f'editor_left:{user["id"]}'):
+            self.db.execute('UPDATE editors SET available=1,fair_load=CASE WHEN fair_load < ? THEN ? ELSE fair_load END WHERE id=?', (baseline, baseline, user['id']))
+            self.s.set(f'editor_left:{user["id"]}', False)
+        if not existing:
+            self.s.event(None, user['id'], 'editor_added_automatically', str(user['id']), self.clock())
+            self.say(self.editors_chat, f'{mention(user["id"], name)} is now an editor. Assignments will be shared fairly.')
 
     def start(self, job, uid):
         self.owner_only(job, uid)
