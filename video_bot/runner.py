@@ -43,8 +43,8 @@ class Runner:
                     self.e.db.execute('UPDATE outbox SET state=?,attempts=?,available_at=?,last_error=? WHERE id=?',
                         ('failed' if permanent else 'pending', attempts, now + delay, str(exc), row['id']))
                     if permanent and row['method'] not in ('answerCallbackQuery',) and row['job_id']:
-                        self.e.say(self.e.editors_chat, f'{self.e.admins()}\nDelivery failed for VID-{row["job_id"]:04d} (Telegram code {exc.code}). Check group permissions and source access, then use /retry.', f'failure:{row["id"]}')
-                log.warning('Outgoing item %s failed with API code %s', row['id'], exc.code)
+                        self.e.say(self.e.editors_chat, f'{self.e.admins()}\nDelivery failed for VID-{row["job_id"]:04d} (Telegram code {exc.code}). {html.escape(exc.reason)}. After correcting it, use /retry.', f'failure:{row["id"]}')
+                log.warning('Outgoing item %s (%s, job %s) failed with API code %s: %s', row['id'], row['method'], row['job_id'], exc.code, exc.reason)
                 if chat:
                     blocked_chats.add(chat)
                     self.chat_next[chat] = now + delay
