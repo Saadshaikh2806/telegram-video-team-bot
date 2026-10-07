@@ -56,7 +56,13 @@ class Engine(ButtonUI):
     def __init__(self, config, store: Store, clock=time.time):
         self.c, self.s, self.clock = config, store, clock
         self.db = store.db
+        self.live_admin_chat = None
         with self.db:
+            if not self.s.get('solo_test_disabled', False):
+                if config.test_mode_auto and len(config.admins) != 1:
+                    raise ValueError('Solo testing requires one configured admin or an explicit TEST_EDITOR_ID.')
+                if config.test_editor_id and config.test_editor_id not in config.admins:
+                    raise ValueError('TEST_EDITOR_ID must belong to a configured admin.')
             for key, value in [('uploaders', config.uploaders), ('editors_chat', config.editors)]:
                 if value and self.s.get(key) is None:
                     self.s.set(key, value)
@@ -78,9 +84,14 @@ class Engine(ButtonUI):
                 self.s.event(None, None, 'groups_corrected', revision, self.clock())
             if self.s.get('report_cursor') is None:
                 self.s.set('report_cursor', self.previous_week()[1])
-            if self.test_editor_id:
-                self.auto_editor({'id': self.test_editor_id, 'first_name': 'Test admin'})
-                self.db.execute('UPDATE editors SET available=1 WHERE id=?', (self.test_editor_id,))
+            if self.test_editor_id and not self.s.get(f'solo_test_initialized:{self.test_editor_id}', False):
+                if not self.db.execute('SELECT 1 FROM editors WHERE id=?', (self.test_editor_id,)).fetchone():
+                    self.auto_editor({'id': self.test_editor_id, 'first_name': 'Test admin'})
+                availability = self.db.execute("SELECT details FROM events WHERE kind='availability' AND details IN (?,?) ORDER BY id DESC LIMIT 1",
+                    (f'{self.test_editor_id}: on', f'{self.test_editor_id}: off')).fetchone()
+                if not availability or availability[0].endswith(': on'):
+                    self.db.execute('UPDATE editors SET available=1 WHERE id=?', (self.test_editor_id,))
+                self.s.set(f'solo_test_initialized:{self.test_editor_id}', True)
 
     @property
     def test_editor_id(self):
@@ -311,7 +322,7 @@ class Engine(ButtonUI):
                 (self.s.get(f'unassigned_editor:{job["id"]}', 0), self.test_editor_id, self.test_editor_id, self.c.max_active)).fetchone()
             if not editor:
                 self.say(self.editors_chat, f'{self.admins()}\n{label(job["id"])} is queued: no editor has a free slot.', f'capacity:{job["id"]}')
-                break
+                continue
             charge = job['effort'] if self.c.mode == 'effort' else 1
             self.db.execute("UPDATE jobs SET editor_id=?,status='dispatching' WHERE id=?", (editor['id'], job['id']))
             self.db.execute('UPDATE editors SET fair_load=fair_load+?,last_assigned=? WHERE id=?', (charge, self.clock(), editor['id']))
@@ -355,19 +366,9 @@ class Engine(ButtonUI):
             if msg.get('message_id') != job['card_id']:
                 raise UserError('Use the latest assignment or Team controls for this video.')
             return self.ui_callback({**cb, 'data': f'ui:{action}:{jid}:{self.ui_token(job)}'})
-        if action == 'start':
-            self.start(job, uid)
-        elif action == 'submit':
-            self.owner_only(job, uid)
-            self.say(self.editors_chat, f'Reply to the assignment with the edited video, or send /submit {jid} https://your-download-link')
-        elif action == 'block':
-            self.owner_only(job, uid)
-            self.say(self.editors_chat, f'Send /block {jid} followed by the reason. An admin can approve a deadline extension.')
-        elif action == 'approve':
-            self.approve(job, uid)
-        elif action == 'revise':
-            self.admin_only(uid)
-            self.ui_callback({**cb, 'data': f'ui:revise:{jid}:{self.ui_token(job)}'})
+        if action in ('approve', 'revise'):
+            raise UserError('This review button is outdated. Open Waiting for review in Team controls to review the current submission.')
+        raise UserError('Unknown button. Open Team controls.')
 
     def command(self, cmd, args, msg, uid):
         chat = msg['chat']['id']
@@ -455,12 +456,13 @@ class Engine(ButtonUI):
             return
         member = update['new_chat_member']
         status = member['status']
-        admins = set(self.s.get(f'group_admins:{self.editors_chat}', []))
-        if status in ('administrator', 'creator'):
-            admins.add(member['user']['id'])
-        else:
-            admins.discard(member['user']['id'])
-        self.set_group_admins(admins)
+        if self.live_admin_chat != self.editors_chat:
+            admins = set(self.s.get(f'group_admins:{self.editors_chat}', []))
+            if status in ('administrator', 'creator'):
+                admins.add(member['user']['id'])
+            else:
+                admins.discard(member['user']['id'])
+            self.set_group_admins(admins)
         if status in ('member', 'administrator', 'creator') or (status == 'restricted' and member.get('is_member')):
             self.auto_editor(member['user'], joined=True)
         else:
@@ -490,8 +492,10 @@ class Engine(ButtonUI):
     def excluded_admin_ids(self):
         return (set(self.c.admins) | set(self.s.get(f'group_admins:{self.editors_chat}', []))) - {self.test_editor_id}
 
-    def set_group_admins(self, ids):
+    def set_group_admins(self, ids, authoritative=False):
         self.s.set(f'group_admins:{self.editors_chat}', sorted(ids))
+        if authoritative:
+            self.live_admin_chat = self.editors_chat
         self.exclude_admins()
 
     def exclude_admins(self):
@@ -641,8 +645,17 @@ class Engine(ButtonUI):
 
     def report_rows(self, start, end):
         rows = []
+        previous_assignments = []
+        for event in self.db.execute("SELECT details,at FROM events WHERE kind='assignment_removed'").fetchall():
+            previous = json.loads(event['details'])
+            # Removing an unfinished assignment before its deadline ends that
+            # delivery obligation; do not later count it as a missed deadline.
+            if previous['first_submitted'] is None and previous['original_due'] is not None and previous['original_due'] > event['at']:
+                previous['original_due'] = None
+            previous_assignments.append(previous)
         for editor in self.db.execute('SELECT * FROM editors ORDER BY name').fetchall():
             jobs = self.db.execute('SELECT * FROM jobs WHERE editor_id=? AND status!=\'cancelled\'', (editor['id'],)).fetchall()
+            jobs += [job for job in previous_assignments if job.get('editor_id') == editor['id']]
             assigned = [j for j in jobs if j['assigned'] is not None and start <= j['assigned'] < end]
             due = [j for j in jobs if j['original_due'] is not None and start <= j['original_due'] < end]
             done = [j for j in jobs if j['approved'] is not None and start <= j['approved'] < end]

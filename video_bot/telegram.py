@@ -11,6 +11,8 @@ class TelegramError(Exception):
     def __init__(self, code, retry_after=0, description='', migrate_to_chat_id=None):
         self.code, self.retry_after = code, retry_after
         self.migrate_to_chat_id = migrate_to_chat_id
+        self.message_not_modified = code == 400 and 'message is not modified' in description.lower()
+        self.message_to_edit_missing = code == 400 and 'message to edit not found' in description.lower()
         self.reason = safe_error_reason(description)
         super().__init__(f'Telegram request failed (code {code}): {self.reason}')
 
@@ -19,6 +21,8 @@ def safe_error_reason(description):
     """Only emit fixed labels; Telegram error text may contain private content."""
     text = description.lower()
     reasons = [
+        ('message is not modified', 'Message already has the requested content'),
+        ('message to edit not found', 'Status message was deleted or is inaccessible'),
         ('upgraded to a supergroup', 'Group upgraded to a supergroup; its saved chat ID needs updating'),
         ('message to copy not found', 'Original message is missing or inaccessible to the bot'),
         ('message to forward not found', 'Original message is missing or inaccessible to the bot'),

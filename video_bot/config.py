@@ -30,6 +30,7 @@ class Config:
     database_url: str = ''
     team_groups: dict = field(default_factory=dict)
     test_editor_id: int = 0
+    test_mode_auto: bool = False
 
     @property
     def tz(self):
@@ -65,11 +66,9 @@ class Config:
         if c.database_url and not c.database_url.startswith(('postgres://', 'postgresql://')):
             raise ValueError('DATABASE_URL must be a Postgres connection URL')
         test_settings = Path(__file__).with_name('test_mode.json')
-        if not c.test_editor_id and test_settings.exists() and json.loads(test_settings.read_text()).get('enabled'):
-            if len(c.admins) != 1:
-                raise ValueError('Solo testing requires one configured admin or an explicit TEST_EDITOR_ID.')
+        c.test_mode_auto = not c.test_editor_id and test_settings.exists() and bool(json.loads(test_settings.read_text()).get('enabled'))
+        if c.test_mode_auto and len(c.admins) == 1:
             c.test_editor_id = c.admins[0]
-        if c.test_editor_id and c.test_editor_id not in c.admins:
-            raise ValueError('TEST_EDITOR_ID must belong to a configured admin.')
+        # Validate active test mode after loading its persisted disabled flag.
         c.tz  # Fail before starting if timezone data is missing.
         return c

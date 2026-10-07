@@ -290,7 +290,7 @@ class BotTests(unittest.TestCase):
         for uid, expected in [(2, 'submitted'), (99, 'approved')]:
             self.seq += 1
             self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'cb{uid}', 'from': {'id': uid},
-                'data': 'approve:1', 'message': {'message_id': 500, 'chat': {'id': -1002}}}})
+                'data': f'ui:approve:1:{self.e.ui_token(self.e.job(1))}', 'message': {'message_id': 500, 'chat': {'id': -1002}}}})
             self.assertEqual(self.e.job(1)['status'], expected)
 
     def test_rate_limit_retries_without_starting_clock(self):
@@ -339,6 +339,127 @@ class BotTests(unittest.TestCase):
         self.config.test_editor_id = 99
         self.e = Engine(self.config, self.store, lambda: self.now)
         self.r = Runner(self.e, self.api)
+
+    def test_unassignable_video_does_not_block_other_videos(self):
+        self.enable_solo_test()
+        self.upload()
+        self.deliver(1)
+        self.message(99, '/unassign 1 Testing')
+        self.upload()
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        self.assertEqual(self.e.job(2)['editor_id'], 99)
+
+    def test_live_admin_snapshot_survives_old_member_event(self):
+        self.upload()
+        with patch.object(self.api, 'call', return_value=[{'user': {'id': 7}}]):
+            self.r.refresh_admins()
+        self.seq += 1
+        self.e.handle({'update_id': self.seq, 'chat_member': {'chat': {'id': -1002},
+            'new_chat_member': {'status': 'member', 'user': {'id': 7}}}})
+        self.assertIn(7, self.e.excluded_admin_ids())
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        with patch.object(self.api, 'call', return_value=[]):
+            self.r.refresh_admins()
+        self.add(7)
+        self.assertEqual(self.e.job(1)['editor_id'], 7)
+
+    def test_old_review_buttons_cannot_approve_new_submission(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, '/submit 1 https://example.org/first')
+        first_token = self.e.ui_token(self.e.job(1))
+        self.message(99, '/revise 1 Fix captions')
+        self.now += 1
+        self.message(1, '/submit 1 https://example.org/second')
+        for data in ('approve:1', 'revise:1', f'ui:approve:1:{first_token}'):
+            self.seq += 1
+            self.e.handle({'update_id': self.seq, 'callback_query': {'id': str(self.seq),
+                'from': {'id': 99}, 'data': data, 'message': {'chat': {'id': -1002}, 'message_id': 555}}})
+            self.assertEqual(self.e.job(1)['status'], 'submitted')
+        self.tap(99, 'approve')
+        self.assertEqual(self.e.job(1)['status'], 'approved')
+
+    def test_reassignment_preserves_previous_performance_counts(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.now += 90000
+        self.add(2)
+        self.message(99, '/unassign 1 Missed deadline')
+        self.deliver(1)
+        self.message(2, '/submit 1 https://example.org/finished')
+        self.message(99, '/approve 1')
+        rows = {r['editor_id']: r for r in self.e.report_rows(0, self.now + 86401)}
+        self.assertEqual((rows[1]['assigned'], rows[1]['due'], rows[1]['on_time']), (1, 1, 0))
+        self.assertEqual((rows[2]['assigned'], rows[2]['approved'], rows[2]['on_time']), (1, 1, 1))
+
+    def test_undelivered_unassignment_does_not_count_as_assignment(self):
+        self.add(1)
+        self.upload()
+        self.message(99, '/unassign 1 Not delivered')
+        row = self.e.report_rows(0, self.now + 86401)[0]
+        self.assertEqual((row['assigned'], row['due']), (0, 0))
+
+    def test_unassignment_before_deadline_does_not_create_false_lateness(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(99, '/unassign 1 Planned leave')
+        self.now += 90000
+        row = self.e.report_rows(0, self.now + 1)[0]
+        self.assertEqual((row['assigned'], row['due']), (1, 0))
+
+    def test_deleted_card_replaced_and_identical_edit_succeeds(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_card' ORDER BY id DESC LIMIT 1").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        self.message(1, '/start_job 1')
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_card' ORDER BY id DESC LIMIT 1").fetchone()
+        with patch.object(self.api, 'call', side_effect=[TelegramError(400, description='message to edit not found'), {'message_id': 9001}]) as api:
+            self.r.deliver(row, json.loads(row['payload']))
+            self.assertEqual([c.args[0] for c in api.call_args_list], ['editMessageText', 'sendMessage'])
+        self.assertEqual(self.store.get('ui_card:-1002:1')['message_id'], 9001)
+        with patch.object(self.api, 'call', side_effect=TelegramError(400, description='message is not modified')):
+            result = self.r.update_text(self.e.ui_card(self.e.job(1)), 9001)
+        self.assertEqual(result['message_id'], 9001)
+
+    def test_deleted_menu_is_replaced_and_pinned(self):
+        self.add(1)
+        with self.db:
+            self.store.set('ui_menu:-1002', 400)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_menu'").fetchone()
+        with patch.object(self.api, 'call', side_effect=[TelegramError(400, description='message to edit not found'), {'message_id': 9002}, True]) as api:
+            self.r.deliver(row, json.loads(row['payload']))
+            self.assertEqual([c.args[0] for c in api.call_args_list], ['editMessageText', 'sendMessage', 'pinChatMessage'])
+        self.assertEqual(self.store.get('ui_menu:-1002'), 9002)
+
+    def test_pause_survives_restart_and_upgrade_from_old_solo_mode(self):
+        self.enable_solo_test()
+        self.message(99, '/availability 99 off')
+        restarted = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(restarted.db.execute('SELECT available FROM editors WHERE id=99').fetchone()[0], 0)
+        with self.db:
+            self.db.execute("DELETE FROM settings WHERE key='solo_test_initialized:99'")
+        restarted = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(restarted.db.execute('SELECT available FROM editors WHERE id=99').fetchone()[0], 0)
+
+    def test_disabled_solo_mode_allows_admin_configuration_changes(self):
+        with self.db:
+            self.store.set('solo_test_disabled', True)
+        with patch.dict(os.environ, {'ADMIN_IDS': '99,100'}, clear=True), patch('video_bot.config.load_env'):
+            config = Config.from_env()
+        restarted = Engine(config, self.store, lambda: self.now)
+        self.assertEqual(restarted.test_editor_id, 0)
+        config.test_editor_id = 123  # Old environment target removed from admin list.
+        restarted = Engine(config, self.store, lambda: self.now)
+        self.assertEqual(restarted.test_editor_id, 0)
+        with self.db:
+            self.store.set('solo_test_disabled', False)
+        with self.assertRaises(ValueError):
+            Engine(config, self.store, lambda: self.now)
 
     def test_solo_test_assigns_only_admin_and_preserves_capacity(self):
         self.add(1)

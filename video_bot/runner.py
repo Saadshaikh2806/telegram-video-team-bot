@@ -91,9 +91,7 @@ class Runner:
         if method in ('ui_menu', 'ui_card', 'ui_prompt'):
             if method == 'ui_menu':
                 saved_menu = e.s.get(f'ui_menu:{e.editors_chat}')
-                result = {'message_id': saved_menu} if saved_menu else self.api.call('sendMessage', **e.ui_menu_payload())
-                if saved_menu:
-                    self.api.call('editMessageText', message_id=saved_menu, **e.ui_menu_payload())
+                result = self.update_text(e.ui_menu_payload(), saved_menu)
                 with e.db:
                     e.s.set(f'ui_menu:{e.editors_chat}', result['message_id'])
                 try:
@@ -116,11 +114,7 @@ class Runner:
                 saved = e.s.get(key)
                 token = e.ui_render_token(job)
                 if not saved or saved['token'] != token:
-                    if saved:
-                        self.api.call('editMessageText', message_id=saved['message_id'], **params)
-                        result = saved
-                    else:
-                        result = self.api.call('sendMessage', **params)
+                    result = self.update_text(params, saved['message_id'] if saved else None)
                     with e.db:
                         e.s.set(key, {'message_id': result['message_id'], 'token': token})
             with e.db:
@@ -164,6 +158,25 @@ class Runner:
             with e.db:
                 e.db.execute("UPDATE outbox SET state='sent' WHERE id=?", (row['id'],))
 
+    def update_text(self, params, message_id=None):
+        if message_id:
+            try:
+                self.api.call('editMessageText', message_id=message_id, **params)
+                return {'message_id': message_id}
+            except TelegramError as exc:
+                if exc.message_not_modified:
+                    return {'message_id': message_id}
+                if not exc.message_to_edit_missing:
+                    raise
+        return self.api.call('sendMessage', **params)
+
+    def refresh_admins(self):
+        if self.e.editors_chat:
+            admins = self.api.call('getChatAdministrators', chat_id=self.e.editors_chat)
+            with self.e.db:
+                self.e.set_group_admins((member['user']['id'] for member in admins), authoritative=True)
+            self.admins_chat_checked = self.e.editors_chat
+
     def run(self, stop=None, health=None):
         import threading
         stop = stop or threading.Event()
@@ -178,21 +191,17 @@ class Runner:
                     self.reconcile_groups()
                 # Refresh before any registrations, reservations or deliveries.
                 # On API failure the loop retries without assigning from a stale list.
-                if self.e.editors_chat:
-                    admins = self.api.call('getChatAdministrators', chat_id=self.e.editors_chat)
-                    with self.e.db:
-                        self.e.set_group_admins(member['user']['id'] for member in admins)
-                    self.admins_chat_checked = self.e.editors_chat
+                self.refresh_admins()
                 pending = self.e.db.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone()
                 updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=2 if pending else 20,
                                         allowed_updates=['message', 'callback_query', 'chat_member'])
                 for update in updates:
                     self.e.handle(update)
                     if self.e.editors_chat and self.e.editors_chat != self.admins_chat_checked:
-                        admins = self.api.call('getChatAdministrators', chat_id=self.e.editors_chat)
-                        with self.e.db:
-                            self.e.set_group_admins(member['user']['id'] for member in admins)
-                        self.admins_chat_checked = self.e.editors_chat
+                        self.refresh_admins()
+                if any('chat_member' in update for update in updates):
+                    # Historical events must not determine roles at delivery time.
+                    self.refresh_admins()
                 self.e.tick()
                 self.flush()
                 if health:

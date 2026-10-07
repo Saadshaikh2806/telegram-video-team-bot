@@ -51,7 +51,11 @@ def main():
     if not config.admins:
         print('ADMIN_IDS is empty. Use /whoami, add your ID to .env, then restart.')
     try:
-        Runner(Engine(config, store), api).run(stop, health)
+        try:
+            engine = Engine(config, store)
+        except ValueError as exc:
+            raise SystemExit(f'Configuration needs attention: {exc}') from None
+        Runner(engine, api).run(stop, health)
     except KeyboardInterrupt:
         print('\nBot stopped. Jobs and deadlines are saved.')
     finally:
