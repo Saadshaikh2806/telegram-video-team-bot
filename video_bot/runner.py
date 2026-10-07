@@ -122,7 +122,7 @@ class Runner:
             with e.db:
                 e.db.execute("UPDATE outbox SET state='skipped' WHERE id=?", (row['id'],))
             return
-        if method in ('ui_menu', 'ui_card', 'ui_prompt'):
+        if method in ('ui_menu', 'ui_card', 'ui_prompt', 'ui_snapshot'):
             if method == 'ui_menu':
                 saved_menu = e.s.get(f'ui_menu:{e.editors_chat}')
                 result = self.update_text(e.ui_menu_payload(), saved_menu)
@@ -142,6 +142,12 @@ class Runner:
                     result = self.api.call('sendMessage', **payload)
                     with e.db:
                         e.s.set(key, {**pending, 'message_id': result['message_id']})
+                else:
+                    delivered = False
+            elif method == 'ui_snapshot':
+                job = e.db.execute('SELECT * FROM jobs WHERE id=?', (row['job_id'],)).fetchone()
+                if job and job['status'] not in ('approved', 'cancelled'):
+                    self.api.call('sendMessage', **e.ui_card(job))
                 else:
                     delivered = False
             else:
@@ -194,7 +200,12 @@ class Runner:
                 # A Render restart deletes local reports. Rebuild the saved snapshot.
                 images, csv_path = build_report(snapshot['rows'], snapshot['title'], 'reports', f'recovered-{row["id"]}')
                 payload['_file'] = str((images[snapshot['page']] if method == 'sendPhoto' else csv_path).resolve())
-            self.api.call(method, **payload)
+            try:
+                self.api.call(method, **payload)
+            except TelegramError as exc:
+                if method not in ('editMessageText', 'editMessageReplyMarkup') or not (exc.message_not_modified or exc.message_to_edit_missing):
+                    raise
+                delivered = False
             with e.db:
                 e.db.execute("UPDATE outbox SET state='sent' WHERE id=?", (row['id'],))
 
@@ -222,6 +233,26 @@ class Runner:
             self.admins_chat_checked = self.e.editors_chat
             self.admins_refresh_at = self.e.clock() + 60
 
+    def poll_timeout(self):
+        """Long polls return immediately on clicks, but end when output is due."""
+        now = self.e.clock()
+        rows = self.e.db.execute("SELECT method,payload,priority,available_at FROM outbox WHERE state='pending' ORDER BY available_at,priority,id LIMIT 100").fetchall()
+        if not rows:
+            return 20
+        ready = now + 20
+        for row in rows:
+            payload = json.loads(row['payload'])
+            chat = payload.get('chat_id', self.e.editors_chat if row['method'] == 'assignment' else 0)
+            at = row['available_at']
+            if chat:
+                recent = [stamp for stamp in self.chat_sent[chat] if stamp > now - 60]
+                paced = recent[-1] + 1.05 if row['priority'] <= 0 and recent else self.chat_next.get(chat, 0)
+                at = max(at, paced, self.chat_retry_after.get(chat, 0))
+                if len(recent) >= 20:
+                    at = max(at, recent[0] + 60)
+            ready = min(ready, at)
+        return max(0, min(20, int(ready - now)))
+
     def run(self, stop=None, health=None):
         import threading
         stop = stop or threading.Event()
@@ -239,8 +270,8 @@ class Runner:
                 # Refresh before any registrations, reservations or deliveries.
                 # On API failure the loop retries without assigning from a stale list.
                 self.refresh_admins(force=False)
-                pending = self.e.db.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone()
-                updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=0 if pending else 20,
+                timeout = self.poll_timeout()
+                updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=timeout,
                                         allowed_updates=['message', 'callback_query', 'chat_member'])
                 for update in updates:
                     self.e.handle(update)
@@ -256,7 +287,7 @@ class Runner:
                 self.flush()
                 if health:
                     health.beat()
-                if pending:
+                if timeout == 0:
                     stop.wait(0.15)
             except TelegramError as exc:
                 log.warning('Telegram unavailable (code %s). Will retry.', exc.code)

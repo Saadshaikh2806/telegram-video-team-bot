@@ -27,7 +27,7 @@ class ButtonUI:
             self.s.enqueue('ui_menu', {'chat_id': self.editors_chat}, f'ui_menu:{self.editors_chat}')
         elif self.editors_chat and self.s.get(f'ui_menu_test_mode:{self.editors_chat}', 0) != self.test_editor_id:
             self.s.enqueue('ui_menu', {'chat_id': self.editors_chat})
-        if self.editors_chat:
+        if self.editors_chat and self.s.get(f'ui_menu_test_mode:{self.editors_chat}') != self.test_editor_id:
             self.s.set(f'ui_menu_test_mode:{self.editors_chat}', self.test_editor_id)
 
     def ui_card(self, job):
@@ -131,7 +131,7 @@ class ButtonUI:
                     where = "status='submitted'"
                 rows = self.db.execute(f'SELECT * FROM jobs WHERE {where} ORDER BY id LIMIT 6 OFFSET ?', (*args, number)).fetchall()
                 for job in rows[:5]:
-                    self.s.enqueue('sendMessage', self.ui_card(job))
+                    self.s.enqueue('ui_snapshot', {'chat_id': chat}, job=job['id'])
                 if not rows:
                     self.say(chat, 'Nothing here right now.')
                 if len(rows) > 5:

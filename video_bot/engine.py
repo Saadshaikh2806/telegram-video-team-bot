@@ -5,6 +5,7 @@ import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 from .store import Store
 from .ui import ButtonUI
@@ -612,7 +613,8 @@ class Engine(ButtonUI):
         self.s.event(job['id'], uid, 'approved', '', self.clock())
         self.say(self.editors_chat, f'{label(job["id"])} approved and complete.')
         self.say(self.uploaders, f'{label(job["id"])} approved. Finished edit follows.')
-        self.s.enqueue('copyMessage', {'chat_id': self.uploaders, 'from_chat_id': job['submission_chat'], 'message_id': job['submission_message']})
+        self.s.enqueue('copyMessage', {'chat_id': self.uploaders, 'from_chat_id': job['submission_chat'], 'message_id': job['submission_message']},
+                       f'finished:{job["id"]}:{job["submission_message"]}', job['id'])
 
     def change_job(self, cmd, job, args, uid):
         now = self.clock()
@@ -702,17 +704,18 @@ class Engine(ButtonUI):
 
     def report_rows(self, start, end):
         rows = []
-        previous_assignments = []
+        jobs_by_editor = defaultdict(list)
+        for job in self.db.execute("SELECT * FROM jobs WHERE editor_id IS NOT NULL AND status!='cancelled'").fetchall():
+            jobs_by_editor[job['editor_id']].append(job)
         for event in self.db.execute("SELECT details,at FROM events WHERE kind='assignment_removed'").fetchall():
             previous = json.loads(event['details'])
             # Removing an unfinished assignment before its deadline ends that
             # delivery obligation; do not later count it as a missed deadline.
             if previous['first_submitted'] is None and previous['original_due'] is not None and previous['original_due'] > event['at']:
                 previous['original_due'] = None
-            previous_assignments.append(previous)
+            jobs_by_editor[previous['editor_id']].append(previous)
         for editor in self.db.execute('SELECT * FROM editors ORDER BY name').fetchall():
-            jobs = self.db.execute('SELECT * FROM jobs WHERE editor_id=? AND status!=\'cancelled\'', (editor['id'],)).fetchall()
-            jobs += [job for job in previous_assignments if job.get('editor_id') == editor['id']]
+            jobs = jobs_by_editor[editor['id']]
             assigned = [j for j in jobs if j['assigned'] is not None and start <= j['assigned'] < end]
             due = [j for j in jobs if j['original_due'] is not None and start <= j['original_due'] < end]
             done = [j for j in jobs if j['approved'] is not None and start <= j['approved'] < end]

@@ -340,6 +340,89 @@ class BotTests(unittest.TestCase):
         self.e = Engine(self.config, self.store, lambda: self.now)
         self.r = Runner(self.e, self.api)
 
+    def test_task_list_renders_current_state_at_delivery(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'tasks', jid=0)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_snapshot'").fetchone()
+        self.message(1, '/start_job 1')
+        self.r.deliver(row, json.loads(row['payload']))
+        self.assertIn('| Editing', self.api.calls[-1][1]['text'])
+        self.assertNotIn('Start editing', json.dumps(self.api.calls[-1][1]))
+
+    def test_task_list_skips_jobs_closed_while_waiting(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'tasks', jid=0)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_snapshot'").fetchone()
+        self.message(99, '/cancel 1 No longer needed')
+        self.assertFalse(self.r.deliver(row, json.loads(row['payload'])))
+        self.assertEqual(self.api.calls, [])
+
+    def test_redundant_edit_is_successful_without_failure_notice(self):
+        with self.db:
+            self.store.enqueue('editMessageReplyMarkup', {'chat_id': -1002, 'message_id': 50, 'reply_markup': {'inline_keyboard': []}})
+        self.api.failure = TelegramError(400, description='message is not modified')
+        self.r.flush()
+        self.assertEqual(self.db.execute('SELECT state FROM outbox').fetchone()[0], 'sent')
+        self.assertNotIn(-1002, self.r.chat_retry_after)
+
+    def test_final_video_delivery_failure_identifies_job(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, video={'file_unique_id': 'finished'}, reply_to_message={'message_id': 1001})
+        self.message(99, '/approve 1')
+        row = self.db.execute("SELECT * FROM outbox WHERE method='copyMessage'").fetchone()
+        self.assertEqual(row['job_id'], 1)
+        with self.db:
+            self.db.execute("UPDATE outbox SET state='sent' WHERE id!=?", (row['id'],))
+        self.api.failure = TelegramError(403)
+        self.r.flush()
+        failure = self.db.execute("SELECT payload FROM outbox WHERE dedupe=?", (f'failure:{row["id"]}',)).fetchone()
+        self.assertIn('VID-0001', json.loads(failure[0])['text'])
+
+    def test_polling_waits_until_retry_but_new_callback_is_immediate(self):
+        with self.db:
+            self.e.say(-1002, 'Delayed')
+            self.db.execute('UPDATE outbox SET available_at=?', (self.now + 10,))
+        self.assertEqual(self.r.poll_timeout(), 10)
+        with self.db:
+            self.store.enqueue('answerCallbackQuery', {'callback_query_id': 'now'})
+        self.assertEqual(self.r.poll_timeout(), 0)
+
+    def test_polling_uses_interactive_gap_instead_of_background_gap(self):
+        with self.db:
+            self.e.say(-1002, 'Background')
+        self.r.flush()
+        with self.db, self.store.prioritized(0):
+            self.e.say(-1002, 'Interactive')
+        self.assertEqual(self.r.poll_timeout(), 1)
+        self.now += 1.1
+        self.assertEqual(self.r.poll_timeout(), 0)
+
+    def test_report_database_reads_do_not_grow_with_editor_count(self):
+        for uid in range(1, 21):
+            self.add(uid)
+        self.upload()
+        self.deliver(1)
+        original = self.e.db
+        statements = []
+        class CountingDB:
+            def execute(self, statement, params=()):
+                statements.append(statement)
+                return original.execute(statement, params)
+        self.e.db = CountingDB()
+        try:
+            rows = self.e.report_rows(0, self.now + 1)
+        finally:
+            self.e.db = original
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(sum(row['assigned'] for row in rows), 1)
+        self.assertEqual(len(statements), 3)
+
     def test_button_response_overtakes_large_notification_backlog(self):
         self.add(1)
         self.upload()

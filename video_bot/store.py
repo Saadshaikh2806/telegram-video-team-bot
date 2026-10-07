@@ -25,11 +25,14 @@ CREATE TABLE IF NOT EXISTS jobs (
  UNIQUE(source_chat, source_message)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS unique_video ON jobs(file_key) WHERE file_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_editor_status ON jobs(editor_id,status);
+CREATE INDEX IF NOT EXISTS jobs_status_id ON jobs(status,id);
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY, job_id INTEGER, actor INTEGER, kind TEXT NOT NULL,
  details TEXT NOT NULL, at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS processed_updates (id INTEGER PRIMARY KEY);
+CREATE INDEX IF NOT EXISTS events_kind ON events(kind);
 CREATE TABLE IF NOT EXISTS outbox (
  id INTEGER PRIMARY KEY, dedupe TEXT UNIQUE, method TEXT NOT NULL, payload TEXT NOT NULL,
  job_id INTEGER, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
