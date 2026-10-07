@@ -14,15 +14,21 @@ class ButtonUI:
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:12]
 
     def ui_menu_payload(self):
-        return {'chat_id': self.editors_chat, 'text': '<b>Team controls</b>\nEditors: open My tasks, start work, then reply with your finished edit.\nAdmins: use the review and team controls below.', 'parse_mode': 'HTML',
+        notice = f'\n\n<b>Solo test mode</b>: new assignments go only to {self.test_editor_id}.' if self.test_editor_id else ''
+        return {'chat_id': self.editors_chat, 'text': '<b>Team controls</b>\nEditors: open My tasks, start work, then reply with your finished edit.\nAdmins: use the review and team controls below.' + notice, 'parse_mode': 'HTML',
                 'reply_markup': {'inline_keyboard': [
                     [button('My tasks', 'tasks:0'), button('Waiting for review', 'reviews:0')],
                     [button('All open videos', 'jobs:0'), button('Editor availability', 'people:0')],
-                    [button('Weekly report', 'report:0')]]}}
+                    [button('Weekly report', 'report:0')]] +
+                    ([[button('End solo testing', 'endtest:0')]] if self.test_editor_id else [])}}
 
     def ui_ensure_menu(self):
         if self.editors_chat and not self.s.get(f'ui_menu:{self.editors_chat}'):
             self.s.enqueue('ui_menu', {'chat_id': self.editors_chat}, f'ui_menu:{self.editors_chat}')
+        elif self.editors_chat and self.s.get(f'ui_menu_test_mode:{self.editors_chat}', 0) != self.test_editor_id:
+            self.s.enqueue('ui_menu', {'chat_id': self.editors_chat})
+        if self.editors_chat:
+            self.s.set(f'ui_menu_test_mode:{self.editors_chat}', self.test_editor_id)
 
     def ui_card(self, job):
         jid, state = job['id'], job['status']
@@ -79,10 +85,18 @@ class ButtonUI:
         chat = cb['message']['chat']['id']
         if chat != self.editors_chat:
             raise UserError('Open Team controls in the Editors group.')
-        if action in ('tasks', 'reviews', 'jobs', 'people', 'report', 'availability'):
+        if action in ('tasks', 'reviews', 'jobs', 'people', 'report', 'availability', 'endtest', 'confirmendtest'):
             if action != 'tasks':
                 self.admin_only(uid)
-            if action == 'report':
+            if action == 'endtest':
+                self.say(chat, 'Resume assignments to the regular editor team? Your current assigned jobs remain recorded.',
+                         reply_markup={'inline_keyboard': [[button('Yes, resume team assignments', 'confirmendtest:0')]]})
+            elif action == 'confirmendtest':
+                self.s.set('solo_test_disabled', True)
+                self.exclude_admins()
+                self.s.event(None, uid, 'solo_test_ended', 'Normal team assignments restored', self.clock())
+                self.say(chat, 'Solo testing ended. New assignments now use the regular editor team.')
+            elif action == 'report':
                 self.command('/report', [], cb['message'], uid)
             elif action == 'availability':
                 self.command('/availability', [str(number), parts[3]], cb['message'], uid)

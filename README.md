@@ -15,6 +15,10 @@ The bot posts **Team controls** in the Editors group and attempts to pin it auto
 
 The five shareable poster images and combined PDF are in `output/pdf/`.
 
+### Temporary solo testing
+
+Set `TEST_EDITOR_ID` to a configured admin's Telegram user ID to restrict new assignments to that person, with an exception to normal admin exclusion. A deployment can instead enable `video_bot/test_mode.json` to use the sole configured admin. Ordinary capacity limits remain in effect. Undelivered reservations for other editors return to the test queue; already-delivered jobs are preserved. Unassigning a test video leaves it queued because no different editor is eligible. Use **End solo testing** in Team controls and confirm to restore normal team assignment. That choice persists across restarts; remove the rollout flag or environment setting after testing.
+
 **Render deployment:** follow [RENDER_SETUP.md](RENDER_SETUP.md). Free Render needs an external Postgres database. Built-in five-minute self-ping helps keep it active, and an external uptime monitor is recommended for wake-up and outage alerts; uninterrupted operation cannot be guaranteed on the free plan.
 
 **Status:** built and tested locally with simulated Telegram responses. A real bot token, two groups, and an always-on computer/server are required to go live. No Telegram messages have been sent during development.

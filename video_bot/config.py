@@ -29,6 +29,7 @@ class Config:
     database: str = 'data/bot.sqlite3'
     database_url: str = ''
     team_groups: dict = field(default_factory=dict)
+    test_editor_id: int = 0
 
     @property
     def tz(self):
@@ -51,6 +52,7 @@ class Config:
             report_hour=int(os.getenv('REPORT_HOUR', '9')),
             database=os.getenv('DATABASE_PATH', 'data/bot.sqlite3'),
             database_url=os.getenv('DATABASE_URL', '').strip(),
+            test_editor_id=int(os.getenv('TEST_EDITOR_ID') or 0),
         )
         if c.mode not in ('effort', 'rotation') or c.max_active < 1 or c.deadline_hours < 1:
             raise ValueError('Invalid assignment mode, capacity, or deadline in .env')
@@ -62,5 +64,12 @@ class Config:
             raise ValueError('Render requires DATABASE_URL for durable Postgres storage; local SQLite is not safe on its free plan')
         if c.database_url and not c.database_url.startswith(('postgres://', 'postgresql://')):
             raise ValueError('DATABASE_URL must be a Postgres connection URL')
+        test_settings = Path(__file__).with_name('test_mode.json')
+        if not c.test_editor_id and test_settings.exists() and json.loads(test_settings.read_text()).get('enabled'):
+            if len(c.admins) != 1:
+                raise ValueError('Solo testing requires one configured admin or an explicit TEST_EDITOR_ID.')
+            c.test_editor_id = c.admins[0]
+        if c.test_editor_id and c.test_editor_id not in c.admins:
+            raise ValueError('TEST_EDITOR_ID must belong to a configured admin.')
         c.tz  # Fail before starting if timezone data is missing.
         return c

@@ -335,6 +335,57 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
         self.assertIsNotNone(self.db.execute('SELECT 1 FROM editors WHERE id=7').fetchone())
 
+    def enable_solo_test(self):
+        self.config.test_editor_id = 99
+        self.e = Engine(self.config, self.store, lambda: self.now)
+        self.r = Runner(self.e, self.api)
+
+    def test_solo_test_assigns_only_admin_and_preserves_capacity(self):
+        self.add(1)
+        self.enable_solo_test()
+        self.config.max_active = 2
+        with self.db:
+            self.e.set_group_admins([99])
+        self.upload()
+        self.upload()
+        self.upload()
+        self.assertEqual(self.e.job(1)['editor_id'], 99)
+        self.assertEqual(self.e.job(2)['editor_id'], 99)
+        self.assertEqual(self.e.job(3)['status'], 'queued')
+        self.deliver(1)
+        self.message(99, '/start_job 1')
+        self.message(99, '/submit 1 https://example.org/test')
+        self.message(99, '/approve 1')
+        self.assertEqual(self.e.job(1)['status'], 'approved')
+        self.assertEqual(self.e.job(3)['editor_id'], 99)
+
+    def test_solo_test_requeues_undelivered_but_preserves_delivered_jobs(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.upload()
+        self.enable_solo_test()
+        self.e.tick()
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
+        self.assertEqual(self.e.job(2)['editor_id'], 99)
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=1').fetchone()[0], 2)
+
+    def test_solo_unassignment_waits_and_normal_mode_can_resume(self):
+        self.add(1)
+        self.enable_solo_test()
+        self.upload()
+        self.deliver(1)
+        self.message(99, '/unassign 1 Try reassignment')
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        with self.db:
+            self.e.ui_callback({'data': 'ui:confirmendtest:0', 'from': {'id': 99},
+                'message': {'chat': {'id': -1002}}})
+        self.e.tick()
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
+        self.assertIn(99, self.e.excluded_admin_ids())
+        restarted = Engine(self.config, self.store, lambda: self.now)
+        self.assertEqual(restarted.test_editor_id, 0)
+
     def tap(self, uid, action, jid=1, token=None):
         self.seq += 1
         data = f'ui:{action}:{jid}'

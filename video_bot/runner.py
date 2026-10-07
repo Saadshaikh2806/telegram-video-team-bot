@@ -92,6 +92,8 @@ class Runner:
             if method == 'ui_menu':
                 saved_menu = e.s.get(f'ui_menu:{e.editors_chat}')
                 result = {'message_id': saved_menu} if saved_menu else self.api.call('sendMessage', **e.ui_menu_payload())
+                if saved_menu:
+                    self.api.call('editMessageText', message_id=saved_menu, **e.ui_menu_payload())
                 with e.db:
                     e.s.set(f'ui_menu:{e.editors_chat}', result['message_id'])
                 try:

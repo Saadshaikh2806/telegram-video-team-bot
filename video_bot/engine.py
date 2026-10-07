@@ -78,6 +78,13 @@ class Engine(ButtonUI):
                 self.s.event(None, None, 'groups_corrected', revision, self.clock())
             if self.s.get('report_cursor') is None:
                 self.s.set('report_cursor', self.previous_week()[1])
+            if self.test_editor_id:
+                self.auto_editor({'id': self.test_editor_id, 'first_name': 'Test admin'})
+                self.db.execute('UPDATE editors SET available=1 WHERE id=?', (self.test_editor_id,))
+
+    @property
+    def test_editor_id(self):
+        return 0 if self.s.get('solo_test_disabled', False) else self.c.test_editor_id
 
     @property
     def uploaders(self):
@@ -288,12 +295,20 @@ class Engine(ButtonUI):
         if not self.editors_chat:
             return
         self.exclude_admins()
+        if self.test_editor_id:
+            # Stop undelivered reservations from reaching other editors after rollout.
+            for pending in self.db.execute("SELECT * FROM jobs WHERE status='dispatching' AND editor_id!=?", (self.test_editor_id,)).fetchall():
+                charge = pending['effort'] if self.c.mode == 'effort' else 1
+                self.db.execute('UPDATE editors SET fair_load=CASE WHEN fair_load < ? THEN 0 ELSE fair_load-? END WHERE id=?', (charge, charge, pending['editor_id']))
+                self.db.execute("UPDATE jobs SET editor_id=NULL,status='queued' WHERE id=?", (pending['id'],))
+                self.s.event(pending['id'], None, 'solo_test_requeued', 'Undelivered reservation moved to the test queue', self.clock())
         for job in self.db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id").fetchall():
             editor = self.db.execute('''SELECT e.* FROM editors e WHERE available=1 AND e.id!=?
+                AND (?=0 OR e.id=?)
                 AND (SELECT COUNT(*) FROM jobs j WHERE j.editor_id=e.id AND j.status IN
                 ('dispatching','assigned','editing','revision','submitted')) < ?
                 ORDER BY fair_load, last_assigned, id LIMIT 1''',
-                (self.s.get(f'unassigned_editor:{job["id"]}', 0), self.c.max_active)).fetchone()
+                (self.s.get(f'unassigned_editor:{job["id"]}', 0), self.test_editor_id, self.test_editor_id, self.c.max_active)).fetchone()
             if not editor:
                 self.say(self.editors_chat, f'{self.admins()}\n{label(job["id"])} is queued: no editor has a free slot.', f'capacity:{job["id"]}')
                 break
@@ -473,7 +488,7 @@ class Engine(ButtonUI):
             self.say(self.editors_chat, f'{mention(user["id"], name)} is now an editor. Assignments will be shared fairly.')
 
     def excluded_admin_ids(self):
-        return set(self.c.admins) | set(self.s.get(f'group_admins:{self.editors_chat}', []))
+        return (set(self.c.admins) | set(self.s.get(f'group_admins:{self.editors_chat}', []))) - {self.test_editor_id}
 
     def set_group_admins(self, ids):
         self.s.set(f'group_admins:{self.editors_chat}', sorted(ids))
