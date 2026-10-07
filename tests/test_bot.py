@@ -340,6 +340,70 @@ class BotTests(unittest.TestCase):
         self.e = Engine(self.config, self.store, lambda: self.now)
         self.r = Runner(self.e, self.api)
 
+    def confirm_reset(self, uid=99, token=None, cancel=False):
+        pending = self.store.get('clear_data:99')
+        self.seq += 1
+        self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'reset{self.seq}',
+            'from': {'id': uid}, 'data': 'clear_data:' + ('cancel:' if cancel else '') + (token or pending['token']),
+            'message': {'chat': {'id': -1002}, 'message_id': 777}}})
+
+    def test_confirmed_reset_clears_work_but_preserves_setup_and_replay_protection(self):
+        self.enable_solo_test()
+        original = self.upload()
+        old_update = self.seq
+        self.deliver(1)
+        self.message(99, '/clear_all_data')
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+        token = self.store.get('clear_data:99')['token']
+        self.confirm_reset()
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM events').fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='assignment'").fetchone()[0], 0)
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=99').fetchone()[0], 0)
+        self.assertEqual((self.e.editors_chat, self.e.uploaders, self.e.test_editor_id), (-1002, -1001, 99))
+        self.e.handle({'update_id': old_update, 'message': original})
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 0)
+        self.upload()
+        new_job = self.db.execute('SELECT * FROM jobs').fetchone()
+        self.assertGreater(new_job['id'], 1)
+        self.assertEqual(new_job['editor_id'], 99)
+        self.confirm_reset(token=token)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+
+    def test_reset_requires_same_admin_and_can_be_cancelled(self):
+        self.add(1)
+        self.upload()
+        self.message(1, '/clear_all_data')
+        self.assertIsNone(self.store.get('clear_data:1'))
+        self.message(99, '/clear_all_data')
+        self.config.admins = (99, 100)
+        self.confirm_reset(uid=100)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+        self.confirm_reset(cancel=True)
+        self.assertIsNone(self.store.get('clear_data:99'))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+
+    def test_reset_rejects_expired_or_changed_preview(self):
+        self.add(1)
+        self.upload()
+        self.message(99, '/clear_all_data')
+        self.now += 601
+        self.confirm_reset()
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 1)
+        self.message(99, '/clear_all_data')
+        self.upload()
+        self.confirm_reset()
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0], 2)
+
+    def test_reset_preserves_disabled_test_mode_and_clears_regular_roster(self):
+        self.add(1)
+        with self.db:
+            self.store.set('solo_test_disabled', True)
+        self.message(99, '/clear_all_data')
+        self.confirm_reset()
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 0)
+        self.assertTrue(self.store.get('solo_test_disabled'))
+
     def test_unassignable_video_does_not_block_other_videos(self):
         self.enable_solo_test()
         self.upload()

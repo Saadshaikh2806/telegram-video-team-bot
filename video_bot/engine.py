@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -37,6 +38,7 @@ Admins:
 /report — previous calendar week's charts and CSV
 /health — queue and delivery status
 /retry — retry failed outgoing messages
+/clear_all_data — erase bot records and start fresh (confirmation required)
 '''
 
 
@@ -352,6 +354,8 @@ class Engine(ButtonUI):
         self.ui_refresh()
 
     def callback(self, cb):
+        if cb.get('data', '').startswith('clear_data:'):
+            return self.confirm_clear_data(cb)
         if cb.get('data', '').startswith('ui:'):
             return self.ui_callback(cb)
         msg = cb.get('message', {})
@@ -372,7 +376,23 @@ class Engine(ButtonUI):
 
     def command(self, cmd, args, msg, uid):
         chat = msg['chat']['id']
-        if cmd == '/join':
+        if cmd == '/clear_all_data':
+            self.admin_only(uid)
+            if chat != self.editors_chat:
+                raise UserError('Run /clear_all_data in the Editors group.')
+            counts = self.reset_counts()
+            token = secrets.token_hex(12)
+            self.s.set(f'clear_data:{uid}', {'token': token, 'chat': chat,
+                'expires': self.clock() + 600, 'counts': counts})
+            self.say(chat, '<b>Start fresh?</b>\n'
+                f'Delete {counts[0]} video jobs, {counts[1]} editor registrations, all job history, '
+                'allocation balances and pending bot messages. This cannot be undone.\n\n'
+                'Group connections and the solo-test setting stay. In solo mode, the tester is re-registered with zero workload. '
+                'Existing Telegram messages, files and previously exported reports are not deleted.\n\n'
+                'Only the admin who requested this can confirm, within 10 minutes.',
+                reply_markup={'inline_keyboard': [[{'text': 'Yes, clear all bot data', 'callback_data': f'clear_data:{token}'},
+                    {'text': 'Keep my data', 'callback_data': f'clear_data:cancel:{token}'}]]})
+        elif cmd == '/join':
             if chat != self.editors_chat:
                 raise UserError('Send a normal message in the Editors group to be registered automatically.')
             self.auto_editor(msg['from'])
@@ -450,6 +470,38 @@ class Engine(ButtonUI):
                 self.change_job(cmd, job, args[1:], uid)
         else:
             raise UserError('Unknown command. Send /help for commands.')
+
+    def reset_counts(self):
+        return [self.db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                for table in ('jobs', 'editors', 'events')]
+
+    def confirm_clear_data(self, cb):
+        uid = cb['from']['id']
+        self.admin_only(uid)
+        pending = self.s.get(f'clear_data:{uid}')
+        chat = cb.get('message', {}).get('chat', {}).get('id')
+        token = cb['data'].split(':')[-1]
+        if not pending or token != pending['token'] or chat != pending['chat'] or chat != self.editors_chat or self.clock() > pending['expires']:
+            raise UserError('This reset request expired or belongs to another admin. Send /clear_all_data again.')
+        if cb['data'].startswith('clear_data:cancel:'):
+            self.s.set(f'clear_data:{uid}', None)
+            self.say(chat, 'Reset cancelled. Your data is unchanged.')
+            return
+        if self.reset_counts() != pending['counts']:
+            raise UserError('The team data changed since this request. Send /clear_all_data again to review the updated totals.')
+        # Keep setup and replay protection. Never reuse job IDs: old Telegram
+        # buttons must not target a new job after a reset.
+        keep = ('uploaders', 'editors_chat', 'team_groups_revision', 'offset', 'solo_test_disabled',
+                f'group_admins:{chat}', f'ui_menu:{chat}', f'ui_menu_test_mode:{chat}')
+        for table in ('outbox', 'events', 'jobs', 'editors'):
+            self.db.execute(f'DELETE FROM {table}')
+        self.db.execute('DELETE FROM settings WHERE key NOT IN (' + ','.join('?' for _ in keep) + ')', keep)
+        self.s.set('report_cursor', self.previous_week()[1])
+        if self.test_editor_id:
+            self.db.execute('INSERT INTO editors(id,name) VALUES (?,?)', (self.test_editor_id, 'Test admin'))
+            self.s.set(f'solo_test_initialized:{self.test_editor_id}', True)
+        self.say(chat, 'Bot data cleared. You can upload a new test video now.' if self.test_editor_id else
+                 'Bot data cleared. Editors should send Hi once to register, then upload a new video.')
 
     def membership(self, update):
         if update['chat']['id'] != self.editors_chat:

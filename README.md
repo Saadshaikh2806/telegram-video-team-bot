@@ -15,6 +15,12 @@ The bot posts **Team controls** in the Editors group and attempts to pin it auto
 
 The five shareable poster images and combined PDF are in `output/pdf/`.
 
+### Start fresh
+
+An admin can send **`/clear_all_data`** in the Editors group, review the totals, then tap **Yes, clear all bot data**. The confirmation belongs to that admin, expires after 10 minutes, and is rejected if job/editor/history counts change. **Keep my data** cancels it.
+
+This clears jobs, registrations, workload balances, job history, pending messages, prompts, and report queues. It preserves group connections, the solo-test setting, and update replay protection. Job IDs are never reused, so old buttons cannot act on new videos. In solo mode the tester is re-registered with zero workload; otherwise editors should send Hi to register again. Existing Telegram messages, files and previously exported report files are not deleted.
+
 ### Temporary solo testing
 
 Set `TEST_EDITOR_ID` to a configured admin's Telegram user ID to restrict new assignments to that person, with an exception to normal admin exclusion. A deployment can instead enable `video_bot/test_mode.json` to use the sole configured admin. Ordinary capacity limits remain in effect. Undelivered reservations for other editors return to the test queue; already-delivered jobs are preserved. Unassigning a test video leaves it queued because no different editor is eligible. Use **End solo testing** in Team controls and confirm to restore normal team assignment. That choice persists across restarts; remove the rollout flag or environment setting after testing.
