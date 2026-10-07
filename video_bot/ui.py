@@ -37,7 +37,9 @@ class ButtonUI:
             return button(text, f'{action}:{jid}:{token}')
         rows = []
         if state in ('assigned', 'editing', 'revision'):
-            rows = [[b('Start editing', 'start'), b('Submit edit', 'submit')], [b('Need help', 'block')]]
+            rows = [[b('Submit edit', 'submit'), b('Need help', 'block')]]
+            if state in ('assigned', 'revision'):
+                rows.insert(0, [b('Start editing', 'start')])
         if state == 'submitted':
             rows = [[b('Approve', 'approve'), b('Request changes', 'revise')]]
         if state not in ('approved', 'cancelled'):
@@ -66,13 +68,17 @@ class ButtonUI:
                 text += f'\n<a href="{html.escape(link, quote=True)}">Open submitted edit</a>'
         return {'chat_id': self.editors_chat, 'text': text, 'parse_mode': 'HTML', 'reply_markup': {'inline_keyboard': rows}}
 
+    def ui_render_token(self, job):
+        # Refresh saved messages when their wording or buttons change in a release.
+        return hashlib.sha256(json.dumps(self.ui_card(job), sort_keys=True).encode()).hexdigest()
+
     def ui_refresh(self):
         if not self.editors_chat:
             return
         self.ui_ensure_menu()
         for job in self.db.execute("SELECT * FROM jobs WHERE status NOT IN ('approved','cancelled') OR id IN (SELECT job_id FROM outbox WHERE method='ui_card')").fetchall():
             key = f'ui_card_token:{self.editors_chat}:{job["id"]}'
-            token = self.ui_token(job)
+            token = self.ui_render_token(job)
             if self.s.get(key) != token:
                 self.s.enqueue('ui_card', {'chat_id': self.editors_chat}, job=job['id'])
                 self.s.set(key, token)
@@ -131,6 +137,11 @@ class ButtonUI:
             self.admin_only(uid)
         if action == 'start':
             self.start(job, uid)
+            saved = self.s.get(f'ui_card:{chat}:{number}', {})
+            message_id = cb['message']['message_id']
+            if message_id not in (job['card_id'], saved.get('message_id')):
+                # Task-list copies should also advance instead of keeping Start editing.
+                self.s.enqueue('editMessageText', {'message_id': message_id, **self.ui_card(self.job(number))})
         elif action == 'approve':
             self.approve(job, uid)
         elif action in ('submit', 'block', 'revise', 'unassign', 'extend', 'cancel'):

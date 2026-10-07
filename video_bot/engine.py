@@ -509,9 +509,16 @@ class Engine(ButtonUI):
         self.owner_only(job, uid)
         if job['status'] not in ('assigned', 'revision', 'editing'):
             raise UserError('This job cannot be started in its current state.')
+        if job['card_id']:
+            self.s.enqueue('editMessageReplyMarkup', {'chat_id': self.editors_chat, 'message_id': job['card_id'],
+                'reply_markup': {'inline_keyboard': [[
+                    {'text': 'Submit edit', 'callback_data': f'submit:{job["id"]}'},
+                    {'text': 'Need help', 'callback_data': f'block:{job["id"]}'}]]}},
+                f'started-buttons:{job["id"]}:{job["card_id"]}', job['id'])
+        if job['status'] == 'editing':
+            return
         self.db.execute("UPDATE jobs SET status='editing' WHERE id=?", (job['id'],))
         self.s.event(job['id'], uid, 'started', '', self.clock())
-        self.say(self.editors_chat, f'{label(job["id"])} is being edited. Deadline: {self.stamp(job["due"])}')
 
     def submit(self, job, uid, msg, link):
         self.owner_only(job, uid)

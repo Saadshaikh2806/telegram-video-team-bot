@@ -114,7 +114,7 @@ class Runner:
                 params = e.ui_card(job)
                 key = f'ui_card:{e.editors_chat}:{job["id"]}'
                 saved = e.s.get(key)
-                token = e.ui_token(job)
+                token = e.ui_render_token(job)
                 if not saved or saved['token'] != token:
                     if saved:
                         self.api.call('editMessageText', message_id=saved['message_id'], **params)

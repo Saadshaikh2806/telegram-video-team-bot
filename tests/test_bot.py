@@ -466,6 +466,40 @@ class BotTests(unittest.TestCase):
         self.r.deliver(menu, json.loads(menu['payload']))
         self.assertEqual(self.api.calls[-1][0], 'pinChatMessage')
 
+    def test_start_removes_start_button_and_does_not_send_extra_confirmation(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'start')
+        card = self.e.ui_card(self.e.job(1))
+        labels = [b['text'] for row in card['reply_markup']['inline_keyboard'] for b in row]
+        self.assertNotIn('Start editing', labels)
+        self.assertIn('Submit edit', labels)
+        self.assertIn('Need help', labels)
+        self.assertIn('| Editing', card['text'])
+        row = self.db.execute("SELECT * FROM outbox WHERE method='editMessageReplyMarkup'").fetchone()
+        payload = json.loads(row['payload'])
+        self.assertEqual(payload['message_id'], 1001)
+        self.assertNotIn('Start editing', json.dumps(payload))
+        self.assertFalse(any('is being edited' in r[0] for r in self.db.execute("SELECT payload FROM outbox WHERE method='sendMessage'").fetchall()))
+        self.message(1, '/start_job 1')
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM events WHERE kind='started'").fetchone()[0], 1)
+
+    def test_start_updates_clicked_task_list_copy(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        token = self.e.ui_token(self.e.job(1))
+        self.seq += 1
+        self.e.handle({'update_id': self.seq, 'callback_query': {'id': 'task-copy',
+            'from': {'id': 1}, 'data': f'ui:start:1:{token}',
+            'message': {'chat': {'id': -1002}, 'message_id': 888}}})
+        row = self.db.execute("SELECT payload FROM outbox WHERE method='editMessageText'").fetchone()
+        payload = json.loads(row[0])
+        self.assertEqual(payload['message_id'], 888)
+        self.assertIn('| Editing', payload['text'])
+        self.assertNotIn('Start editing', json.dumps(payload))
+
     def test_plain_source_link_creates_job(self):
         self.message(50, 'https://example.org/source Add captions', chat=-1001)
         self.assertEqual(self.e.job(1)['file_key'], 'https://example.org/source')
