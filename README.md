@@ -159,6 +159,8 @@ Current scope: one uploader group and one editor group, text/link/video jobs, ma
 
 ## Development and verification
 
+Button actions commit and acknowledge before assignment-queue maintenance. Their prompts get an immediate delivery attempt, and the worker checks for new updates between background sends. Background output uses at most 15 of the shared 20 sends per minute, leaving five slots for interactive replies; Telegram retry-after limits still apply. These changes require a running deployment of the latest commit.
+
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe demo.py

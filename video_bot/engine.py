@@ -137,7 +137,7 @@ class Engine(ButtonUI):
         if uid != job['editor_id']:
             raise UserError('Only the assigned editor can do that.')
 
-    def handle(self, update):
+    def handle(self, update, defer_maintenance=False):
         interactive = bool(update.get('callback_query') or update.get('message', {}).get('reply_to_message'))
         with self.s.prioritized(0 if interactive else 10), self.db:
             self.s.begin_write()
@@ -168,8 +168,9 @@ class Engine(ButtonUI):
                     **({'text': callback_error[:200], 'show_alert': True} if callback_error else {})})
             self.db.execute('INSERT INTO processed_updates VALUES (?)', (update['update_id'],))
             self.s.set('offset', update['update_id'] + 1)
-            self.assign()
-            self.ui_refresh()
+            if not defer_maintenance:
+                self.assign()
+                self.ui_refresh()
 
     def message(self, msg):
         chat = msg['chat']['id']

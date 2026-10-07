@@ -471,6 +471,57 @@ class BotTests(unittest.TestCase):
         self.r.flush()
         self.assertEqual(self.api.calls[-1][1]['text'], 'Wait for quota')
 
+    def test_background_messages_leave_capacity_for_button_reply(self):
+        self.r.chat_sent[-1002].extend([self.now - 5] * 15)
+        with self.db:
+            self.e.say(-1002, 'Background')
+        self.r.flush()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual(self.r.poll_timeout(), 20)
+        with self.db, self.store.prioritized(0):
+            self.e.say(-1002, 'Button reply')
+        self.assertEqual(self.r.poll_timeout(), 0)
+        self.r.flush()
+        self.assertEqual([p['text'] for _, p in self.api.calls], ['Button reply'])
+
+    def test_click_ack_and_prompt_precede_assignment_scan(self):
+        import threading
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        with self.db:
+            self.db.execute('DELETE FROM outbox')
+        stop = threading.Event()
+        self.r.groups_checked = True
+        self.r.admins_chat_checked = -1002
+        self.r.admins_refresh_at = self.now + 60
+        update = {'update_id': self.seq + 1, 'callback_query': {
+            'id': 'latency-test', 'from': {'id': 1},
+            'data': f'ui:submit:1:{self.e.ui_token(self.e.job(1))}',
+            'message': {'chat': {'id': -1002}, 'message_id': 1001}}}
+        original_call, original_assign = self.api.call, self.e.assign
+        def call(method, **params):
+            if method == 'getUpdates':
+                stop.set()
+                return [update]
+            return original_call(method, **params)
+        def assign():
+            self.assertEqual(self.api.calls[0][0], 'answerCallbackQuery')
+            self.assertTrue(self.api.calls[1][1]['reply_markup']['force_reply'])
+            return original_assign()
+        with patch.object(self.api, 'call', side_effect=call), patch.object(self.e, 'assign', side_effect=assign) as scan:
+            self.r.run(stop)
+        scan.assert_called_once()
+
+    def test_deferred_updates_still_assign_on_tick(self):
+        self.add(1)
+        self.e.handle({'update_id': self.seq + 1, 'message': {
+            'message_id': 900, 'chat': {'id': -1001}, 'from': {'id': 50},
+            'video': {'file_unique_id': 'deferred'}, 'caption': 'Edit this'}}, defer_maintenance=True)
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        self.e.tick()
+        self.assertEqual(self.e.job(1)['status'], 'dispatching')
+
     def test_repeated_submit_tap_preserves_existing_question(self):
         self.add(1)
         self.upload()

@@ -58,10 +58,11 @@ class Runner:
                 log.info('Recovered upgraded group binding; affected deliveries requeued')
         self.groups_checked = True
 
-    def flush(self, limit=15):
+    def flush(self, limit=15, interactive_only=False):
         self.flush_callbacks()
         now = self.e.clock()
-        rows = self.e.db.execute("SELECT * FROM outbox WHERE state='pending' AND method!='answerCallbackQuery' AND available_at<=? ORDER BY priority,id LIMIT 100", (now,)).fetchall()
+        priority_filter = ' AND priority<=0' if interactive_only else ''
+        rows = self.e.db.execute("SELECT * FROM outbox WHERE state='pending' AND method!='answerCallbackQuery' AND available_at<=?" + priority_filter + " ORDER BY priority,id LIMIT 100", (now,)).fetchall()
         sent = 0
         blocked_chats = set()
         for row in rows:
@@ -75,7 +76,9 @@ class Runner:
             while recent and recent[0] <= now - 60:
                 recent.popleft()
             paced_until = (recent[-1] + 1.05 if recent else 0) if row['priority'] <= 0 else self.chat_next.get(chat, 0)
-            if chat and (chat in blocked_chats or self.chat_retry_after.get(chat, 0) > now or paced_until > now or len(recent) >= 20):
+            # Leave five of the group's twenty sends per minute for user actions.
+            quota = 20 if row['priority'] <= 0 else 15
+            if chat and (chat in blocked_chats or self.chat_retry_after.get(chat, 0) > now or paced_until > now or len(recent) >= quota):
                 blocked_chats.add(chat)
                 continue
             try:
@@ -248,8 +251,9 @@ class Runner:
                 recent = [stamp for stamp in self.chat_sent[chat] if stamp > now - 60]
                 paced = recent[-1] + 1.05 if row['priority'] <= 0 and recent else self.chat_next.get(chat, 0)
                 at = max(at, paced, self.chat_retry_after.get(chat, 0))
-                if len(recent) >= 20:
-                    at = max(at, recent[0] + 60)
+                quota = 20 if row['priority'] <= 0 else 15
+                if len(recent) >= quota:
+                    at = max(at, recent[-quota] + 60)
             ready = min(ready, at)
         return max(0, min(20, int(ready - now)))
 
@@ -274,17 +278,26 @@ class Runner:
                 updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=timeout,
                                         allowed_updates=['message', 'callback_query', 'chat_member'])
                 for update in updates:
-                    self.e.handle(update)
+                    # Commit the action and acknowledge it before scanning queued
+                    # assignments or preparing deadline notifications.
+                    self.e.handle(update, defer_maintenance=True)
                     self.flush_callbacks()
+                    interactive = bool(update.get('callback_query') or update.get('message', {}).get('reply_to_message'))
+                    if interactive:
+                        with self.e.s.prioritized(0), self.e.db:
+                            self.e.ui_refresh()
+                        self.flush(limit=1, interactive_only=True)
                     if self.e.editors_chat and self.e.editors_chat != self.admins_chat_checked:
                         self.refresh_admins()
                 if any('chat_member' in update for update in updates):
                     # Historical events must not determine roles at delivery time.
                     self.refresh_admins()
-                if self.e.clock() >= self.next_tick:
+                if updates or self.e.clock() >= self.next_tick:
                     self.e.tick()
                     self.next_tick = self.e.clock() + 1
-                self.flush()
+                # Return to receiving clicks between outgoing messages instead of
+                # blocking on a batch of up to fifteen network requests.
+                self.flush(limit=1)
                 if health:
                     health.beat()
                 if timeout == 0:
