@@ -31,6 +31,7 @@ class Config:
     team_groups: dict = field(default_factory=dict)
     test_editor_id: int = 0
     test_mode_auto: bool = False
+    dashboard_url: str = ''
 
     @property
     def tz(self):
@@ -54,6 +55,7 @@ class Config:
             database=os.getenv('DATABASE_PATH', 'data/bot.sqlite3'),
             database_url=os.getenv('DATABASE_URL', '').strip(),
             test_editor_id=int(os.getenv('TEST_EDITOR_ID') or 0),
+            dashboard_url=(os.getenv('DASHBOARD_URL') or os.getenv('RENDER_EXTERNAL_URL') or '').rstrip('/'),
         )
         if c.mode not in ('effort', 'rotation') or c.max_active < 1 or c.deadline_hours < 1:
             raise ValueError('Invalid assignment mode, capacity, or deadline in .env')

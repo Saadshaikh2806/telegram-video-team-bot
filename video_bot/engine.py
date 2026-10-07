@@ -56,10 +56,12 @@ class UserError(Exception):
 
 
 class Engine(ButtonUI):
-    def __init__(self, config, store: Store, clock=time.time):
+    def __init__(self, config, store: Store, clock=time.time, initialize=True):
         self.c, self.s, self.clock = config, store, clock
         self.db = store.db
         self.live_admin_chat = None
+        if not initialize:
+            return
         with self.db:
             if not self.s.get('solo_test_disabled', False):
                 if config.test_mode_auto and len(config.admins) != 1:
@@ -195,6 +197,17 @@ class Engine(ButtonUI):
             return
         if user.get('is_bot') or msg.get('sender_chat'):
             return  # Anonymous admins must switch to their personal identity.
+        command_parts = text.split()
+        if command_parts and (command_parts[0].split('@')[0] == '/dashboard' or
+                (command_parts[0].split('@')[0] == '/start' and command_parts[1:] == ['dashboard'])):
+            if chat != uid:
+                raise UserError('Open a private chat with this bot and send /dashboard to sign in.')
+            from .dashboard import issue_login
+            url = issue_login(self, uid)
+            with self.s.prioritized(0):
+                self.say(chat, 'Your private dashboard link expires in 10 minutes and can be used once. Do not share it.',
+                         reply_markup={'inline_keyboard': [[{'text': 'Open my dashboard', 'url': url}]]})
+            return
         if chat == self.editors_chat and self.ui_reply(msg):
             return
         if text.split('@')[0] in ('/help', '/start', '/menu'):
@@ -498,9 +511,9 @@ class Engine(ButtonUI):
             raise UserError('The team data changed since this request. Send /clear_all_data again to review the updated totals.')
         # Keep setup and replay protection. Never reuse job IDs: old Telegram
         # buttons must not target a new job after a reset.
-        keep = ('uploaders', 'editors_chat', 'team_groups_revision', 'offset', 'solo_test_disabled',
+        keep = ('uploaders', 'editors_chat', 'team_groups_revision', 'offset', 'solo_test_disabled', 'bot_username',
                 f'group_admins:{chat}', f'ui_menu:{chat}', f'ui_menu_test_mode:{chat}')
-        for table in ('outbox', 'events', 'jobs', 'editors'):
+        for table in ('outbox', 'events', 'jobs', 'editors', 'web_auth'):
             self.db.execute(f'DELETE FROM {table}')
         self.db.execute('DELETE FROM settings WHERE key NOT IN (' + ','.join('?' for _ in keep) + ')', keep)
         self.s.set('report_cursor', self.previous_week()[1])
@@ -671,6 +684,7 @@ class Engine(ButtonUI):
     def tick(self):
         now = self.clock()
         with self.db:
+            self.s.begin_write()
             self.assign()
             self.ui_refresh()
             for job in self.db.execute("SELECT * FROM jobs WHERE status IN ('assigned','editing','revision') AND due IS NOT NULL").fetchall():

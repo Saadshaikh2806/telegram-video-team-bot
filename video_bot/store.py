@@ -32,7 +32,12 @@ CREATE TABLE IF NOT EXISTS events (
  details TEXT NOT NULL, at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS processed_updates (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS web_auth (
+ token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, kind TEXT NOT NULL, expires REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS web_auth_expiry ON web_auth(expires);
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind);
+CREATE INDEX IF NOT EXISTS events_job_kind ON events(job_id,kind,id);
 CREATE TABLE IF NOT EXISTS outbox (
  id INTEGER PRIMARY KEY, dedupe TEXT UNIQUE, method TEXT NOT NULL, payload TEXT NOT NULL,
  job_id INTEGER, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
@@ -42,19 +47,21 @@ CREATE TABLE IF NOT EXISTS outbox (
 
 
 class Store:
-    def __init__(self, path, database_url=''):
+    def __init__(self, path, database_url='', initialize=True):
         self.owner = uuid.uuid4().hex
         self.remote = bool(database_url)
         self.priority = 10
         self.changed_jobs = set()
         if self.remote:
             from .postgres import PostgresConnection
-            self.db = PostgresConnection(database_url, SCHEMA)
+            self.db = PostgresConnection(database_url, SCHEMA if initialize else None)
             return
         if path != ':memory:':
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
+        if not initialize:
+            return
         self.db.executescript(SCHEMA)
         if 'priority' not in [row[1] for row in self.db.execute('PRAGMA table_info(outbox)')]:
             self.db.execute('ALTER TABLE outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 10')
@@ -90,6 +97,9 @@ class Store:
     def begin_write(self):
         if not self.remote:
             self.db.execute('BEGIN IMMEDIATE')
+        else:
+            # Serialize bot and dashboard decisions across separate connections.
+            self.db.execute('SELECT pg_advisory_xact_lock(7142091)')
 
     def lease(self):
         """Only one Render instance polls/sends during overlapping deployments."""

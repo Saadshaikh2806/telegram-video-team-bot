@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Frame · Video team</title><link rel="icon" href="data:,"><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/" aria-label="Frame home"><span class="mark">f.</span> frame<span class="brand-sub">TEAM WORKSPACE</span></a><div id="identity"></div></header>
+<main>
+<section id="login" class="login" hidden><div class="eyebrow">LESS CHAT. MORE CREATING.</div><h1>Your next edit,<br>one click away.</h1><p>Manage your work here. Keep your video files in Telegram.</p><div class="login-box"><h2>Welcome to your workspace</h2><p>Sign in with a private link from your team bot. No new password to remember.</p><a id="bot-login" class="primary" hidden>Sign in through Telegram ↗</a><p id="login-fallback">Open your bot in Telegram and send <strong>/dashboard</strong>.</p><small>Only registered editors and team admins can sign in.</small></div><div class="steps"><span>01 &nbsp; Upload in Telegram</span><span>02 &nbsp; Manage here</span><span>03 &nbsp; Deliver in Telegram</span></div></section>
+<section id="workspace" hidden>
+<div class="page-title"><div><div class="eyebrow" id="role-label">YOUR WORKSPACE</div><h1>Make room for great work.</h1><p id="subtitle">Your videos, deadlines, and next steps. All in one place.</p></div><a id="upload-link" class="primary" target="_blank" rel="noopener noreferrer" hidden>Upload in Telegram ↗</a></div>
+<div id="test-notice" class="notice" hidden>Solo test mode · New assignments go only to the test admin.</div>
+<div class="stats" id="stats"></div>
+<div class="toolbar"><nav aria-label="Task filters" id="filters"><button data-filter="open" class="selected">In progress</button><button data-filter="mine">My tasks</button><button data-filter="review">Needs review</button><button data-filter="closed">Completed</button><button data-filter="team" id="team-tab">Team</button></nav><label class="search">⌕ <input id="search" type="search" placeholder="Find a video…" aria-label="Find a video"></label></div>
+<div class="list-heading"><h2 id="list-title">In progress</h2><div><span id="sync" role="status">Loading…</span><button id="refresh" class="quiet">Refresh</button></div></div>
+<div id="cards" class="cards"></div><div id="empty" class="empty" hidden><span>✓</span><h2>All clear here.</h2><p>No videos match this view.</p></div>
+<footer><span>Files stay in Telegram. Decisions happen here.</span><span id="limit-note"></span></footer>
+</section>
+<div id="loading" class="empty"><h2>Opening your workspace…</h2></div>
+</main>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<dialog id="action-dialog"><form id="action-form"><div class="eyebrow" id="dialog-job"></div><h2 id="dialog-title"></h2><p id="dialog-copy"></p><label id="hours-label" hidden>Extra hours<input id="hours" type="number" min="1" max="168" value="24"></label><label id="reason-label">Reason<textarea id="reason" rows="4" maxlength="1000" placeholder="Give your teammate a little context…"></textarea></label><div class="dialog-actions"><button type="button" id="dialog-cancel" class="secondary">Go back</button><button type="submit" class="primary" id="dialog-confirm">Confirm</button></div></form></dialog>
+</body></html>

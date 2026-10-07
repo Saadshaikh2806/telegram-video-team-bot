@@ -13,6 +13,7 @@ from .telegram import Telegram, TelegramError
 from .health import Health
 from .keepalive import start_keepalive
 from .database_errors import database_error_hint
+from .dashboard import Dashboard
 
 
 def main():
@@ -31,7 +32,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     api = Telegram(config.token)
     try:
-        api.call('getMe')
+        bot = api.call('getMe')
         if api.call('getWebhookInfo').get('url'):
             raise SystemExit('This bot has a webhook. Use a separate bot or remove its webhook before starting this polling bot.')
     except TelegramError as exc:
@@ -41,8 +42,10 @@ def main():
     except Exception as exc:
         raise SystemExit('Could not open the database. ' + database_error_hint(exc, config.database_url) + ' Credentials have not been logged.') from None
     health = Health()
+    with store.db:
+        store.set('bot_username', bot.get('username', ''))
     if os.getenv('PORT'):
-        health.start(int(os.environ['PORT']))
+        health.start(int(os.environ['PORT']), Dashboard(config))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     if health.server:

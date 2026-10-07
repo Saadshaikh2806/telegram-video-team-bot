@@ -64,6 +64,8 @@ For manual Web Service creation, use these settings:
 
 Render provides `PORT` automatically. The bot listens on `0.0.0.0` and that port. `/health` contains only `{"status":"ok"}`; it does not expose names, jobs, IDs, or secrets. It returns 503 if the worker stops making progress.
 
+The same service now hosts the workflow dashboard at `/`. After deploying the latest commit, open your Render service URL and choose **Sign in through Telegram**, or privately send `/dashboard` to your bot. The private sign-in link expires in ten minutes. Render supplies the dashboard URL automatically through `RENDER_EXTERNAL_URL`; set `DASHBOARD_URL` only to override it with your HTTPS custom domain. No additional bot permissions or file transfers are needed. Keep monitoring `/health`, not the dashboard page. The web app saves workflow actions directly to the shared database; Telegram file delivery continues in the worker.
+
 ## 4. Add external monitoring
 
 In an external HTTP uptime-monitoring service that supports five-minute checks:

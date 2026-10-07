@@ -36,6 +36,8 @@ class PostgresConnection:
     def __init__(self, url, sqlite_schema):
         self.connection = psycopg.connect(url, autocommit=True, connect_timeout=15)
         self.transactions = []
+        if sqlite_schema is None:
+            return
         schema = '\n'.join(line for line in sqlite_schema.splitlines() if not line.startswith('PRAGMA'))
         schema = schema.replace('INTEGER', 'BIGINT').replace('REAL', 'DOUBLE PRECISION')
         schema = schema.replace('BIGINT PRIMARY KEY AUTOINCREMENT', 'BIGSERIAL PRIMARY KEY')

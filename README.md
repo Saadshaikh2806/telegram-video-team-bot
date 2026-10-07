@@ -2,6 +2,18 @@
 
 Automatically assign uploaded videos to editors, track delivery, notify admins when a deadline is missed, and post weekly performance charts.
 
+## Web dashboard: manage here, keep files in Telegram
+
+The existing web service now serves a responsive dashboard at `/`. No separate frontend hosting, file storage service, or new dependencies are required. Upload original videos in Uploaders as before; editors use **Open video** to download in Telegram and **Submit in Telegram** to reply to the assignment with their finished file. The bot records the submission automatically.
+
+Editors see only their own work and can start an edit or report a blocker. Configured admins see the team queue, review and approve submissions, request changes, extend deadlines, return a job to the queue for another editor, cancel work, and pause/resume editor availability. Solo test mode and existing assignment rules still apply. The dashboard shows up to 300 jobs with open work first; it refreshes every 12 seconds while visible. An action returns its saved state immediately, without waiting for Telegram delivery.
+
+**Sign in:** open the service URL and choose **Sign in through Telegram**, then open the private link sent by the bot. Alternatively, send `/dashboard` in a private chat with the bot. Login links expire after ten minutes and are single-use; browser sessions last seven days. Only registered, non-departed editors and configured admins can sign in. No bot token is sent to the browser. A data reset also signs everyone out.
+
+**Deployment:** Render's `RENDER_EXTERNAL_URL` supplies the dashboard address automatically. If using a custom domain, set `DASHBOARD_URL=https://your-domain.example` and use that address consistently. Keep the `/health` health check. For local use set `PORT=8766` and `DASHBOARD_URL=http://127.0.0.1:8766` before starting the bot. Production requires HTTPS. Free-host cold starts and database latency can still affect the site; moving the controls does not change the hosting plan.
+
+**Safe local preview:** run `.\.venv\Scripts\python.exe demo_dashboard.py` and open the printed link. This uses disposable sample records, binds to localhost, and never connects to Telegram. It does not load or modify the real team's database.
+
 ## Everyday use: buttons first
 
 The bot posts **Team controls** in the Editors group and attempts to pin it automatically. Give it permission to pin messages, or have a group admin pin the message manually. `/menu` or `/help` opens another copy; `/commands` lists optional shortcuts and setup commands.

@@ -13,11 +13,14 @@ class Health:
     def beat(self):
         self.last_progress = time.monotonic()
 
-    def start(self, port):
+    def start(self, port, dashboard=None, host='0.0.0.0'):
         health = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if dashboard and self.path.split('?')[0] not in ('/health', '/healthz'):
+                    dashboard.handle(self)
+                    return
                 if self.path not in ('/', '/health', '/healthz'):
                     self.send_error(404)
                     return
@@ -29,9 +32,15 @@ class Health:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_POST(self):
+                if dashboard:
+                    dashboard.handle(self)
+                else:
+                    self.send_error(404)
+
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(('0.0.0.0', port), Handler)
+        self.server = ThreadingHTTPServer((host, port), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         return self.server

@@ -16,7 +16,7 @@ class ButtonUI:
     def ui_menu_payload(self):
         notice = f'\n\n<b>Solo test mode</b>: new assignments go only to {self.test_editor_id}.' if self.test_editor_id else ''
         return {'chat_id': self.editors_chat, 'text': '<b>Team controls</b>\nEditors: open My tasks, start work, then reply with your finished edit.\nAdmins: use the review and team controls below.' + notice, 'parse_mode': 'HTML',
-                'reply_markup': {'inline_keyboard': [
+                'reply_markup': {'inline_keyboard': ([[{'text': 'Open dashboard', 'url': self.c.dashboard_url}]] if self.c.dashboard_url else []) + [
                     [button('My tasks', 'tasks:0'), button('Waiting for review', 'reviews:0')],
                     [button('All open videos', 'jobs:0'), button('Editor availability', 'people:0')],
                     [button('Weekly report', 'report:0')]] +
@@ -25,10 +25,13 @@ class ButtonUI:
     def ui_ensure_menu(self):
         if self.editors_chat and not self.s.get(f'ui_menu:{self.editors_chat}'):
             self.s.enqueue('ui_menu', {'chat_id': self.editors_chat}, f'ui_menu:{self.editors_chat}')
-        elif self.editors_chat and self.s.get(f'ui_menu_test_mode:{self.editors_chat}', 0) != self.test_editor_id:
+        elif self.editors_chat and (self.s.get(f'ui_menu_test_mode:{self.editors_chat}', 0) != self.test_editor_id or
+                                   self.s.get(f'ui_menu_url:{self.editors_chat}', '') != self.c.dashboard_url):
             self.s.enqueue('ui_menu', {'chat_id': self.editors_chat})
         if self.editors_chat and self.s.get(f'ui_menu_test_mode:{self.editors_chat}') != self.test_editor_id:
             self.s.set(f'ui_menu_test_mode:{self.editors_chat}', self.test_editor_id)
+        if self.editors_chat and self.s.get(f'ui_menu_url:{self.editors_chat}', '') != self.c.dashboard_url:
+            self.s.set(f'ui_menu_url:{self.editors_chat}', self.c.dashboard_url)
 
     def ui_card(self, job):
         jid, state = job['id'], job['status']
