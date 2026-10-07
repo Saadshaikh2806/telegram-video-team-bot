@@ -22,6 +22,8 @@ class FakeTelegram:
         if self.failure:
             raise self.failure
         self.calls.append((method, params))
+        if method == 'getChatAdministrators':
+            return []
         return {'message_id': 1000 + len(self.calls)}
 
 
@@ -332,6 +334,201 @@ class BotTests(unittest.TestCase):
         self.message(99, new_chat_members=[{'id': 7, 'first_name': 'Editor'}, {'id': 8, 'is_bot': True}])
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 1)
         self.assertIsNotNone(self.db.execute('SELECT 1 FROM editors WHERE id=7').fetchone())
+
+    def tap(self, uid, action, jid=1, token=None):
+        self.seq += 1
+        data = f'ui:{action}:{jid}'
+        if action not in ('tasks', 'reviews', 'jobs', 'people', 'report'):
+            data += ':' + (token or self.e.ui_token(self.e.job(jid)))
+        self.e.handle({'update_id': self.seq, 'callback_query': {'id': f'cb{self.seq}',
+            'from': {'id': uid, 'first_name': 'Person'}, 'data': data,
+            'message': {'chat': {'id': -1002}, 'message_id': 1001}}})
+
+    def prompt_id(self):
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_prompt' ORDER BY id DESC LIMIT 1").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        return self.api.calls[-1][0], self.api.calls[-1][1], 1000 + len(self.api.calls)
+
+    def test_guided_submission_review_and_revision(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'submit')
+        _, payload, mid = self.prompt_id()
+        self.assertTrue(payload['reply_markup']['force_reply'])
+        self.message(2, 'https://example.org/wrong', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+        self.message(1, 'https://example.org/edit', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'submitted')
+        self.assertIn('https://example.org/edit', self.e.ui_card(self.e.job(1))['text'])
+        self.tap(1, 'approve')
+        self.assertEqual(self.e.job(1)['status'], 'submitted')
+        self.tap(99, 'revise')
+        _, _, mid = self.prompt_id()
+        self.message(99, 'Please fix the captions', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'revision')
+
+    def test_guided_unassign_and_stale_button(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        old = self.e.ui_token(self.e.job(1))
+        self.tap(99, 'unassign')
+        _, _, mid = self.prompt_id()
+        self.message(99, 'On leave', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        self.tap(1, 'start', token=old)
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+
+    def test_guided_extend_cancel_and_expiry(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        due = self.e.job(1)['due']
+        self.tap(99, 'extend')
+        _, _, mid = self.prompt_id()
+        self.message(99, '4 Waiting for footage', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['due'], due + 14400)
+        self.tap(99, 'cancel')
+        _, _, mid = self.prompt_id()
+        self.message(99, 'Never mind', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+        self.tap(99, 'cancel')
+        _, _, mid = self.prompt_id()
+        self.now += 3601
+        self.message(99, 'Cancel it', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+
+    def test_status_card_updates_in_place_and_menu_pin_is_optional(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_card' ORDER BY id DESC LIMIT 1").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        saved = self.store.get('ui_card:-1002:1')['message_id']
+        self.tap(1, 'start')
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_card' ORDER BY id DESC LIMIT 1").fetchone()
+        self.r.deliver(row, json.loads(row['payload']))
+        self.assertEqual(self.api.calls[-1][0], 'editMessageText')
+        self.assertEqual(self.api.calls[-1][1]['message_id'], saved)
+        menu = self.db.execute("SELECT * FROM outbox WHERE method='ui_menu'").fetchone()
+        self.r.deliver(menu, json.loads(menu['payload']))
+        self.assertEqual(self.api.calls[-1][0], 'pinChatMessage')
+
+    def test_plain_source_link_creates_job(self):
+        self.message(50, 'https://example.org/source Add captions', chat=-1001)
+        self.assertEqual(self.e.job(1)['file_key'], 'https://example.org/source')
+
+    def test_unassign_waits_for_different_editor_and_resets_deadline(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        old_due = self.e.job(1)['due']
+        self.message(99, '/unassign VID-0001 Editor unavailable')
+        job = self.e.job(1)
+        self.assertEqual(job['status'], 'queued')
+        for field in ('editor_id', 'due', 'card_id', 'assigned'):
+            self.assertIsNone(job[field])
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=1').fetchone()[0], 0)
+        self.e.tick()
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        self.now += 3600
+        self.add(2)
+        self.assertEqual(self.e.job(1)['editor_id'], 2)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.assertEqual(row['state'], 'pending')
+        self.r.deliver(row, {})
+        self.assertEqual(self.e.job(1)['due'], old_due + 3600)
+        self.message(1, '/submit 1 https://example.org/old-edit')
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+
+    def test_unassign_clears_submission_but_preserves_audit_and_started_effort(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, '/submit 1 https://example.org/edit')
+        self.message(99, '/unassign 1 Different editor needed')
+        job = self.e.job(1)
+        for field in ('submitted', 'first_submitted', 'submission_chat', 'submission_message', 'submission_link'):
+            self.assertIsNone(job[field])
+        self.assertEqual(job['revisions'], 0)
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=1').fetchone()[0], 2)
+        audit = self.db.execute("SELECT details FROM events WHERE kind='assignment_removed'").fetchone()[0]
+        self.assertEqual(json.loads(audit)['submission_link'], 'https://example.org/edit')
+        self.message(99, '/approve 1')
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+
+    def test_unassign_requires_admin_reason_open_assignment_and_editors_group(self):
+        self.add(1)
+        self.upload()
+        for uid, text, chat in ((1, '/unassign 1 reason', -1002),
+                                (99, '/unassign 1', -1002),
+                                (99, '/unassign 1 reason', -1001)):
+            self.message(uid, text, chat=chat)
+            self.assertEqual(self.e.job(1)['status'], 'dispatching')
+        self.message(99, '/cancel 1 Test')
+        self.message(99, '/unassign 1 Test')
+        self.assertEqual(self.e.job(1)['status'], 'cancelled')
+
+    def test_unassign_skips_old_reminders_and_reassigns_immediately(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.add(2)
+        self.now += 23 * 3600
+        self.e.tick()
+        self.message(99, '/unassign 1 On leave')
+        self.assertEqual(self.e.job(1)['editor_id'], 2)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE dedupe LIKE 'alert:%' AND state='pending'").fetchone()[0], 0)
+
+    def test_admins_cannot_register_or_receive_assignments(self):
+        with self.db:
+            self.e.set_group_admins([7, 8])
+        for uid in (7, 8, 99):
+            self.add(uid)
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM editors').fetchone()[0], 0)
+        self.upload()
+        self.assertEqual(self.e.job(1)['status'], 'queued')
+        self.add(1)
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
+
+    def test_promotion_requeues_undelivered_job_and_cannot_be_reenabled(self):
+        self.add(7)
+        self.upload()
+        self.add(1)
+        self.seq += 1
+        self.e.handle({'update_id': self.seq, 'chat_member': {'chat': {'id': -1002},
+            'new_chat_member': {'status': 'administrator', 'user': {'id': 7}}}})
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
+        self.assertEqual(self.db.execute('SELECT fair_load FROM editors WHERE id=7').fetchone()[0], 0)
+        self.message(99, '/availability 7 on')
+        self.add(7)
+        self.assertEqual(self.db.execute('SELECT available FROM editors WHERE id=7').fetchone()[0], 0)
+
+    def test_admin_sync_preserves_delivered_jobs(self):
+        self.add(7)
+        self.upload()
+        self.deliver(1)
+        with self.db:
+            self.e.set_group_admins([7])
+        self.assertEqual(self.e.job(1)['editor_id'], 7)
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+        self.upload()
+        self.assertEqual(self.e.job(2)['status'], 'queued')
+
+    def test_excluded_reservation_delivers_when_editor_later_joins(self):
+        self.add(7)
+        self.upload()
+        with self.db:
+            self.e.set_group_admins([7])
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.r.deliver(row, {})
+        self.add(1)
+        row = self.db.execute("SELECT * FROM outbox WHERE method='assignment'").fetchone()
+        self.assertEqual(row['state'], 'pending')
+        self.r.deliver(row, {})
+        self.assertEqual(self.e.job(1)['status'], 'assigned')
+        self.assertEqual(self.e.job(1)['editor_id'], 1)
 
     def test_existing_member_registers_on_normal_message_only_in_editors(self):
         self.message(7, 'Hi', chat=-1001)

@@ -2,6 +2,19 @@
 
 Automatically assign uploaded videos to editors, track delivery, notify admins when a deadline is missed, and post weekly performance charts.
 
+## Everyday use: buttons first
+
+The bot posts **Team controls** in the Editors group and attempts to pin it automatically. Give it permission to pin messages, or have a group admin pin the message manually. `/menu` or `/help` opens another copy; `/commands` lists optional shortcuts and setup commands.
+
+- Uploaders send a video with instructions, or paste a source link with instructions.
+- Editors tap **My tasks**, **Start editing**, **Submit edit**, or **Need help**. Submit edit and Need help ask a follow-up question; reply directly to that question.
+- Configured bot admins use **Waiting for review**, **All open videos**, **Editor availability**, and **Weekly report**. Video cards offer **Approve**, **Request changes**, **Change editor**, **More time**, and **Cancel video** when applicable.
+- Each video has a status message that updates in place. Original footage stays available in its assignment message. Task-list results are snapshots; outdated buttons ask the user to open the latest card.
+- Guided actions are bound to the person, group, video state and bot question. They survive restarts, expire after one hour, and reject stale replies. Reply **Never mind** to stop. More time accepts an extra-hour count (1-168) followed by a reason.
+- Everyone can see group buttons, but management actions still require the configured `ADMIN_IDS` allowlist. Only the assigned editor can start, submit or report a blocker.
+
+The five shareable poster images and combined PDF are in `output/pdf/`.
+
 **Render deployment:** follow [RENDER_SETUP.md](RENDER_SETUP.md). Free Render needs an external Postgres database. Built-in five-minute self-ping helps keep it active, and an external uptime monitor is recommended for wake-up and outage alerts; uninterrupted operation cannot be guaranteed on the free plan.
 
 **Status:** built and tested locally with simulated Telegram responses. A real bot token, two groups, and an always-on computer/server are required to go live. No Telegram messages have been sent during development.
@@ -15,7 +28,7 @@ Dependencies are already installed in `.venv` on this computer.
 3. If you do not know your numeric Telegram user ID, leave admin IDs blank. Start the bot and send it `/whoami` in a private chat. Stop it with Ctrl+C, open **Configure Bot.cmd**, add your number to the admin IDs field, save, then start it again. Separate multiple admin IDs with commas.
 4. Create the **Video Uploaders** and **Video Editors** groups, or use your existing groups. Add the bot to both. Make it an administrator so it can receive ordinary uploads and replies. Allow it to send messages, videos, photos, and documents. It does not need permission to delete messages or manage members.
 5. From your personal Telegram account listed in `ADMIN_IDS`, send `/bind_uploaders` inside the Uploaders group and `/bind_editors` inside the Editors group. Anonymous admin messages are not accepted for administrative actions.
-6. Anyone joining the Editors group is automatically registered, except bots. Existing group members should send one normal message (for example, Hi) so the bot can identify them. No registration approval is needed. The bot must be a group administrator to receive membership updates.
+6. Non-admin members joining the Editors group are automatically registered. Bots, group administrators, the group owner, and configured bot admins are excluded. Existing group members should send one normal message (for example, Hi) so the bot can identify them. No registration approval is needed. The bot must be a group administrator to receive membership updates.
 7. Upload a short test video in Uploaders with the caption `Add English captions #effort1`. Check that it arrives with the assigned editor and deadline in Editors.
 8. Have that editor reply to the assignment with an edited video, then have an admin approve it. Check that the approved result appears in Uploaders.
 
@@ -42,6 +55,8 @@ Default mode is **equal assigned effort**. Simple = 1, standard = 2, complex = 3
 This balances work among eligible editors over time, rather than resetting everyone to zero each Monday. Counts can differ when effort, availability, or capacity differs. Editors who are at capacity are skipped; waiting jobs are assigned when capacity opens. Review-pending jobs count toward the limit to prevent unlimited unfinished review queues.
 
 New editors start at the current minimum allocation balance, so they do not receive a large catch-up backlog. When an admin reactivates an editor after leave, their balance is raised to at least the current minimum. Existing jobs and deadlines remain active during leave. Cancelling a job before editing begins refunds its allocation charge; cancellation after work starts does not erase effort already allocated.
+
+Admins can send `/unassign 12 Editor unavailable` in the Editors group to return an unfinished assigned video to the queue. The job keeps its ID and source, frees the previous editor's slot, and excludes that editor from its next assignment. If no other eligible editor is available, it waits. The new editor gets a fresh deadline upon delivery. Previous submission and timing details are retained in the audit history and cleared from the current assignment; old pending reminders are stopped. Allocation points are refunded only before editing or submission has begun, as with cancellation. Unassignment does not pause the former editor for other videos; use `/availability USER_ID off` for leave.
 
 For equal **video count**, set `ASSIGNMENT_MODE=rotation` before initial use. The same availability/capacity rules apply, with each job charged as 1. Do not switch modes on an existing team's database without recalculating its balances.
 
@@ -92,6 +107,7 @@ The sample in `reports/sample-performance-1.png` uses fictional data and does no
 | `/cancel 12 reason` | Admin | Close a job without completion |
 | `/jobs` | Admin | Show latest 30 open jobs |
 | `/editors` | Admin | Show roster and allocation balances |
+| `/unassign 12 reason` | Admin | Return an unfinished assigned video to the queue for a different editor |
 | `/report` | Admin | Generate the previous week's report |
 | `/health` | Admin | Show job queue and message-delivery failures |
 | `/retry` | Admin | Retry failed outgoing messages after fixing access |
@@ -139,4 +155,4 @@ Official references: [Telegram Bot API](https://core.telegram.org/bots/api) and 
 
 The owner-confirmed group IDs are in `video_bot/team_groups.json`: Editors `-1004430488373`, Uploaders `-1004411321528`. A change to this file corrects saved bindings once on startup, preserving later Telegram migration updates. These IDs are not credentials. No Render environment changes are needed for these two groups.
 
-Telegram does not provide a bot API to list all existing members. Existing editors must send a normal message once; future joins are automatic while the bot is an administrator and receiving updates. Human administrators who join or send a normal message are included too; use `/availability USER_ID off` for admins who do not edit.
+Telegram does not provide a bot API to list all existing members. Existing editors must send a normal message once; future joins are automatic while the bot is an administrator and receiving updates. The bot refreshes the group administrator list before processing each batch. Admins already registered are disabled for new assignments and hidden from `/editors`; `/availability USER_ID on` cannot override this exclusion. Undelivered admin assignments return to the queue. Already-delivered jobs and their deadlines remain recorded. Restart or redeploy the updated bot to apply this rule.

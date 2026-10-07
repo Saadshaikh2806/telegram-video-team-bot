@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta
 
 from .store import Store
+from .ui import ButtonUI
 
 
 HELP = '''Video team bot
@@ -13,7 +14,7 @@ HELP = '''Video team bot
 Uploaders: post a video with an editing brief. Add #effort1, #effort2, or #effort3 (default: 2). One upload = one job; for multi-part footage use /new https://folder-link brief #effort2.
 
 Editors:
-Group members become editors automatically. Existing members: send a normal message once.
+Non-admin group members become editors automatically. Group admins and the owner are excluded. Existing members: send a normal message once.
 /whoami — your Telegram ID
 /myjobs — your open work
 /job 12 — job details
@@ -32,6 +33,7 @@ Admins:
 /revise 12 feedback — request revision, with a new 24-hour deadline
 /extend 12 HOURS reason — extend the current deadline
 /cancel 12 reason
+/unassign 12 reason — return a video to the queue for another editor
 /report — previous calendar week's charts and CSV
 /health — queue and delivery status
 /retry — retry failed outgoing messages
@@ -50,7 +52,7 @@ class UserError(Exception):
     pass
 
 
-class Engine:
+class Engine(ButtonUI):
     def __init__(self, config, store: Store, clock=time.time):
         self.c, self.s, self.clock = config, store, clock
         self.db = store.db
@@ -141,6 +143,7 @@ class Engine:
             self.db.execute('INSERT INTO processed_updates VALUES (?)', (update['update_id'],))
             self.s.set('offset', update['update_id'] + 1)
             self.assign()
+            self.ui_refresh()
 
     def message(self, msg):
         chat = msg['chat']['id']
@@ -165,7 +168,15 @@ class Engine:
             return
         if user.get('is_bot') or msg.get('sender_chat'):
             return  # Anonymous admins must switch to their personal identity.
-        if text.split('@')[0] in ('/help', '/start'):
+        if chat == self.editors_chat and self.ui_reply(msg):
+            return
+        if text.split('@')[0] in ('/help', '/start', '/menu'):
+            if chat == self.editors_chat:
+                self.s.enqueue('sendMessage', self.ui_menu_payload())
+            else:
+                self.say(chat, 'Uploaders: send one video with instructions, or a source link with instructions. Editors: use the pinned Team controls in the Editors group. For setup and optional shortcuts, use /commands.')
+            return
+        if text.split('@')[0] == '/commands':
             self.say(chat, HELP)
             return
         if text.startswith('/unbind_'):
@@ -205,6 +216,8 @@ class Engine:
             return
         if chat == self.uploaders and self.video(msg):
             self.create_job(msg, text)
+        elif chat == self.uploaders and self.link(text):
+            self.create_job(msg, text, self.link(text))
         elif chat == self.editors_chat and ('video' in msg or 'document' in msg or self.link(text)):
             reply_id = msg.get('reply_to_message', {}).get('message_id')
             job = self.db.execute('SELECT * FROM jobs WHERE card_id=?', (reply_id,)).fetchone()
@@ -274,11 +287,13 @@ class Engine:
     def assign(self):
         if not self.editors_chat:
             return
+        self.exclude_admins()
         for job in self.db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY id").fetchall():
-            editor = self.db.execute('''SELECT e.* FROM editors e WHERE available=1
+            editor = self.db.execute('''SELECT e.* FROM editors e WHERE available=1 AND e.id!=?
                 AND (SELECT COUNT(*) FROM jobs j WHERE j.editor_id=e.id AND j.status IN
                 ('dispatching','assigned','editing','revision','submitted')) < ?
-                ORDER BY fair_load, last_assigned, id LIMIT 1''', (self.c.max_active,)).fetchone()
+                ORDER BY fair_load, last_assigned, id LIMIT 1''',
+                (self.s.get(f'unassigned_editor:{job["id"]}', 0), self.c.max_active)).fetchone()
             if not editor:
                 self.say(self.editors_chat, f'{self.admins()}\n{label(job["id"])} is queued: no editor has a free slot.', f'capacity:{job["id"]}')
                 break
@@ -287,6 +302,7 @@ class Engine:
             self.db.execute('UPDATE editors SET fair_load=fair_load+?,last_assigned=? WHERE id=?', (charge, self.clock(), editor['id']))
             self.s.event(job['id'], None, 'reserved', f'editor={editor["id"]}; charge={charge}', self.clock())
             self.s.enqueue('assignment', {}, f'assignment:{job["id"]}', job['id'])
+            self.db.execute("UPDATE outbox SET state='pending',available_at=0,attempts=0,last_error=NULL WHERE method='assignment' AND job_id=?", (job['id'],))
 
     def assignment_payload(self, job, now):
         due = now + self.c.deadline_hours * 3600
@@ -306,9 +322,12 @@ class Engine:
                         (card_id, now, due, due, jid))
         job = self.job(jid)
         self.s.event(jid, None, 'assigned', f'due={due}', now)
-        self.say(self.uploaders, f'{label(jid)} assigned to {html.escape(self.editor_name(job["editor_id"]))}.\nDue: {self.stamp(due)}', f'assigned:{jid}')
+        self.say(self.uploaders, f'{label(jid)} assigned to {html.escape(self.editor_name(job["editor_id"]))}.\nDue: {self.stamp(due)}', f'assigned:{jid}:{card_id}')
+        self.ui_refresh()
 
     def callback(self, cb):
+        if cb.get('data', '').startswith('ui:'):
+            return self.ui_callback(cb)
         msg = cb.get('message', {})
         if msg.get('chat', {}).get('id') != self.editors_chat:
             raise UserError('Use the buttons in the Editors group.')
@@ -317,6 +336,10 @@ class Engine:
             self.say(self.editors_chat, 'Editor approval is no longer needed. Members register automatically when they join or send a normal message here.')
             return
         job, uid = self.job(int(jid)), cb['from']['id']
+        if action in ('start', 'submit', 'block'):
+            if msg.get('message_id') != job['card_id']:
+                raise UserError('Use the latest assignment or Team controls for this video.')
+            return self.ui_callback({**cb, 'data': f'ui:{action}:{jid}:{self.ui_token(job)}'})
         if action == 'start':
             self.start(job, uid)
         elif action == 'submit':
@@ -329,7 +352,7 @@ class Engine:
             self.approve(job, uid)
         elif action == 'revise':
             self.admin_only(uid)
-            self.say(self.editors_chat, f'Send /revise {jid} followed by the requested changes.')
+            self.ui_callback({**cb, 'data': f'ui:revise:{jid}:{self.ui_token(job)}'})
 
     def command(self, cmd, args, msg, uid):
         chat = msg['chat']['id']
@@ -346,6 +369,8 @@ class Engine:
         elif cmd == '/availability':
             self.admin_only(uid)
             eid, state = int(args[0]), args[1].lower()
+            if state == 'on' and eid in self.excluded_admin_ids():
+                raise UserError('Admins are excluded from editor assignments.')
             if state not in ('on', 'off') or not self.db.execute('SELECT 1 FROM editors WHERE id=?', (eid,)).fetchone():
                 raise UserError('Use /availability USER_ID on or off for a registered editor.')
             baseline = self.db.execute('SELECT COALESCE(MIN(fair_load),0) FROM editors WHERE available=1 AND id!=?', (eid,)).fetchone()[0]
@@ -364,7 +389,8 @@ class Engine:
             self.say(chat, '\n'.join(f'{label(j["id"])} · {j["status"]} · {self.stamp(j["due"]) if j["due"] else "awaiting assignment"}' for j in rows) or 'No open jobs. (Lists show the latest 30.)')
         elif cmd == '/editors':
             self.admin_only(uid)
-            rows = self.db.execute('SELECT * FROM editors ORDER BY id').fetchall()
+            rows = [r for r in self.db.execute('SELECT * FROM editors ORDER BY id').fetchall()
+                    if r['id'] not in self.excluded_admin_ids()]
             if not rows:
                 self.say(chat, 'No editors detected yet. Existing members should send a normal message here once.')
             for offset in range(0, len(rows), 20):
@@ -382,7 +408,7 @@ class Engine:
             self.admin_only(uid)
             self.db.execute("UPDATE outbox SET state='pending',available_at=0,attempts=0 WHERE state='failed' AND method!='answerCallbackQuery'")
             self.say(chat, 'Failed deliveries have been queued for another attempt.')
-        elif cmd in ('/job', '/start_job', '/submit', '/block', '/approve', '/revise', '/extend', '/cancel'):
+        elif cmd in ('/job', '/start_job', '/submit', '/block', '/approve', '/revise', '/extend', '/cancel', '/unassign'):
             job = self.job(int(args[0].upper().replace('VID-', '')))
             if cmd == '/job':
                 self.say(chat, f'<b>{label(job["id"])}</b> · {job["status"]}\nEditor: {html.escape(self.editor_name(job["editor_id"]))}\nDue: {self.stamp(job["due"]) if job["due"] else "pending"}\n\n{html.escape(job["brief"])}')
@@ -414,6 +440,12 @@ class Engine:
             return
         member = update['new_chat_member']
         status = member['status']
+        admins = set(self.s.get(f'group_admins:{self.editors_chat}', []))
+        if status in ('administrator', 'creator'):
+            admins.add(member['user']['id'])
+        else:
+            admins.discard(member['user']['id'])
+        self.set_group_admins(admins)
         if status in ('member', 'administrator', 'creator') or (status == 'restricted' and member.get('is_member')):
             self.auto_editor(member['user'], joined=True)
         else:
@@ -427,7 +459,7 @@ class Engine:
         self.s.event(None, user['id'], 'editor_left', 'New assignments disabled; existing jobs retained', self.clock())
 
     def auto_editor(self, user, joined=False):
-        if user.get('is_bot') or not user.get('id'):
+        if user.get('is_bot') or not user.get('id') or user['id'] in self.excluded_admin_ids():
             return
         existing = self.db.execute('SELECT 1 FROM editors WHERE id=?', (user['id'],)).fetchone()
         name = ' '.join(filter(None, [user.get('first_name'), user.get('last_name')]))[:100] or str(user['id'])
@@ -439,6 +471,24 @@ class Engine:
         if not existing:
             self.s.event(None, user['id'], 'editor_added_automatically', str(user['id']), self.clock())
             self.say(self.editors_chat, f'{mention(user["id"], name)} is now an editor. Assignments will be shared fairly.')
+
+    def excluded_admin_ids(self):
+        return set(self.c.admins) | set(self.s.get(f'group_admins:{self.editors_chat}', []))
+
+    def set_group_admins(self, ids):
+        self.s.set(f'group_admins:{self.editors_chat}', sorted(ids))
+        self.exclude_admins()
+
+    def exclude_admins(self):
+        for uid in self.excluded_admin_ids():
+            self.db.execute('UPDATE editors SET available=0 WHERE id=?', (uid,))
+            # Undelivered reservations can be reassigned; keep delivered job history.
+            for job in self.db.execute("SELECT * FROM jobs WHERE editor_id=? AND status='dispatching'", (uid,)).fetchall():
+                charge = job['effort'] if self.c.mode == 'effort' else 1
+                self.db.execute('UPDATE editors SET fair_load=CASE WHEN fair_load < ? THEN 0 ELSE fair_load-? END WHERE id=?', (charge, charge, uid))
+                self.db.execute("UPDATE jobs SET editor_id=NULL,status='queued' WHERE id=?", (job['id'],))
+                self.db.execute("UPDATE outbox SET state='pending',available_at=0,attempts=0,last_error=NULL WHERE method='assignment' AND job_id=?", (job['id'],))
+                self.s.event(job['id'], uid, 'admin_excluded', 'Undelivered assignment returned to queue', self.clock())
 
     def start(self, job, uid):
         self.owner_only(job, uid)
@@ -461,7 +511,7 @@ class Engine:
             (submitted, submitted, msg['chat']['id'], msg['message_id'], link, job['id']))
         self.s.event(job['id'], uid, 'submitted', link or 'Telegram attachment', now)
         if self.c.approval:
-            buttons = [[{'text': 'Approve', 'callback_data': f'approve:{job["id"]}'}, {'text': 'Request changes', 'callback_data': f'revise:{job["id"]}'}]]
+            buttons = self.ui_card(self.job(job['id']))['reply_markup']['inline_keyboard']
             self.say(self.editors_chat, f'{self.admins()}\n{label(job["id"])} submitted for review. Editor deadline alerts are stopped.',
                      reply_parameters={'message_id': msg['message_id']}, reply_markup={'inline_keyboard': buttons})
             self.say(self.uploaders, f'{label(job["id"])} submitted; awaiting admin review.')
@@ -485,7 +535,22 @@ class Engine:
         now = self.clock()
         if job['status'] in ('approved', 'cancelled'):
             raise UserError('This job is already closed.')
-        if cmd == '/cancel':
+        if cmd == '/unassign':
+            reason = ' '.join(args).strip()
+            if not reason or not job['editor_id'] or job['status'] == 'queued':
+                raise UserError('Use /unassign JOB_ID reason on an assigned, unfinished job.')
+            self.s.event(job['id'], uid, 'assignment_removed', json.dumps(dict(job)), now)
+            self.s.set(f'unassigned_editor:{job["id"]}', job['editor_id'])
+            if job['status'] in ('dispatching', 'assigned'):
+                charge = job['effort'] if self.c.mode == 'effort' else 1
+                self.db.execute('UPDATE editors SET fair_load=CASE WHEN fair_load < ? THEN 0 ELSE fair_load-? END WHERE id=?', (charge, charge, job['editor_id']))
+            self.db.execute("""UPDATE jobs SET status='queued',editor_id=NULL,assigned=NULL,
+                due=NULL,original_due=NULL,card_id=NULL,first_submitted=NULL,submitted=NULL,
+                approved=NULL,revisions=0,submission_chat=NULL,submission_message=NULL,
+                submission_link=NULL WHERE id=?""", (job['id'],))
+            self.db.execute("UPDATE outbox SET state='skipped' WHERE job_id=? AND state IN ('pending','failed')", (job['id'],))
+            reason += '\nReturned to the queue for a different editor. A fresh deadline starts when the new assignment is delivered.'
+        elif cmd == '/cancel':
             reason = ' '.join(args)
             if not reason:
                 raise UserError('Include a cancellation reason.')
@@ -521,6 +586,7 @@ class Engine:
         now = self.clock()
         with self.db:
             self.assign()
+            self.ui_refresh()
             for job in self.db.execute("SELECT * FROM jobs WHERE status IN ('assigned','editing','revision') AND due IS NOT NULL").fetchall():
                 remaining = job['due'] - now
                 stage = 'overdue' if remaining <= 0 else '2h' if remaining <= 2 * 3600 else '6h' if remaining <= 6 * 3600 else None
