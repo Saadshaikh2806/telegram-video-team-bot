@@ -340,6 +340,153 @@ class BotTests(unittest.TestCase):
         self.e = Engine(self.config, self.store, lambda: self.now)
         self.r = Runner(self.e, self.api)
 
+    def test_button_response_overtakes_large_notification_backlog(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        with self.db:
+            self.db.execute('DELETE FROM outbox')
+            for n in range(150):
+                self.e.say(-1002, f'Background notice {n}')
+        self.tap(1, 'submit')
+        self.r.flush()
+        self.assertEqual(self.api.calls[0][0], 'answerCallbackQuery')
+        self.assertTrue(self.api.calls[1][1]['reply_markup']['force_reply'])
+        self.assertFalse(any('Background notice' in p.get('text', '') for _, p in self.api.calls))
+
+    def test_interactive_reply_uses_short_gap_but_respects_retry_after(self):
+        with self.db:
+            self.e.say(-1002, 'Background')
+        self.r.flush()
+        with self.db, self.store.prioritized(0):
+            self.e.say(-1002, 'Interactive')
+        self.now += 1.1
+        self.r.flush()
+        self.assertEqual(self.api.calls[-1][1]['text'], 'Interactive')
+        with self.db, self.store.prioritized(0):
+            self.e.say(-1002, 'Rate limited')
+        self.now += 1.1
+        self.api.failure = TelegramError(429, retry_after=10)
+        self.r.flush()
+        self.api.failure = None
+        count = len(self.api.calls)
+        self.now += 2
+        self.r.flush()
+        self.assertEqual(len(self.api.calls), count)
+        self.now += 9
+        self.r.flush()
+        self.assertEqual(self.api.calls[-1][1]['text'], 'Rate limited')
+
+    def test_callback_ack_bypasses_full_group_quota(self):
+        with self.db, self.store.prioritized(0):
+            self.store.enqueue('answerCallbackQuery', {'callback_query_id': 'fast'})
+            self.e.say(-1002, 'Wait for quota')
+        self.r.chat_sent[-1002].extend([self.now - 5] * 20)
+        self.r.flush()
+        self.assertEqual([m for m, _ in self.api.calls], ['answerCallbackQuery'])
+        self.now += 56
+        self.r.flush()
+        self.assertEqual(self.api.calls[-1][1]['text'], 'Wait for quota')
+
+    def test_repeated_submit_tap_preserves_existing_question(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'submit')
+        _, _, mid = self.prompt_id()
+        self.tap(1, 'submit')
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='ui_prompt'").fetchone()[0], 1)
+        self.message(1, 'https://example.org/finished', reply_to_message={'message_id': mid})
+        self.assertEqual(self.e.job(1)['status'], 'submitted')
+
+    def test_changed_video_suppresses_queued_question(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'submit')
+        self.message(99, '/cancel 1 No longer needed')
+        row = self.db.execute("SELECT * FROM outbox WHERE method='ui_prompt'").fetchone()
+        self.assertFalse(self.r.deliver(row, json.loads(row['payload'])))
+        self.assertEqual(self.api.calls, [])
+
+    def test_status_updates_coalesce_and_unchanged_jobs_are_not_rendered(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.message(1, '/start_job 1')
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='ui_card' AND state='pending'").fetchone()[0], 1)
+        with patch.object(self.e, 'ui_render_token', wraps=self.e.ui_render_token) as render:
+            with self.db:
+                self.e.ui_refresh()
+            render.assert_not_called()
+
+    def test_admin_cache_refreshes_on_demand_and_expiry(self):
+        self.r.refresh_admins(force=False)
+        self.r.refresh_admins(force=False)
+        self.assertEqual(len(self.api.calls), 1)
+        self.r.refresh_admins()
+        self.assertEqual(len(self.api.calls), 2)
+        self.now += 61
+        self.r.refresh_admins(force=False)
+        self.assertEqual(len(self.api.calls), 3)
+
+    def test_invalid_button_returns_direct_alert(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        with self.db:
+            self.db.execute('DELETE FROM outbox')
+        self.tap(2, 'start')
+        self.r.flush_callbacks()
+        payload = self.api.calls[-1][1]
+        self.assertTrue(payload['show_alert'])
+        self.assertIn('assigned editor', payload['text'])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='sendMessage'").fetchone()[0], 0)
+
+    def test_pending_output_disables_long_poll_wait(self):
+        import threading
+        stop = threading.Event()
+        original = self.api.call
+        def api(method, **params):
+            if method == 'getUpdates':
+                self.assertEqual(params['timeout'], 0)
+                stop.set()
+                return []
+            return original(method, **params)
+        with self.db:
+            self.e.say(-1002, 'Pending')
+        with patch.object(self.api, 'call', side_effect=api):
+            self.r.run(stop)
+
+    def test_failed_question_can_be_requested_again(self):
+        self.add(1)
+        self.upload()
+        self.deliver(1)
+        self.tap(1, 'submit')
+        with self.db:
+            self.db.execute("UPDATE outbox SET state='failed' WHERE method='ui_prompt'")
+        self.tap(1, 'submit')
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM outbox WHERE method='ui_prompt' AND state='pending'").fetchone()[0], 1)
+
+    def test_old_sqlite_outbox_gains_priority_without_losing_rows(self):
+        import sqlite3
+        from video_bot.store import SCHEMA
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / 'old.sqlite3')
+            db = sqlite3.connect(path)
+            db.executescript(SCHEMA.replace(', priority INTEGER NOT NULL DEFAULT 10', ''))
+            db.execute("INSERT INTO outbox(method,payload) VALUES ('sendMessage','{}')")
+            db.commit()
+            db.close()
+            upgraded = Store(path)
+            try:
+                self.assertEqual(upgraded.db.execute('SELECT priority FROM outbox').fetchone()[0], 10)
+                with upgraded.db, upgraded.prioritized(0):
+                    upgraded.enqueue('sendMessage', {'text': 'Interactive'})
+                self.assertEqual(upgraded.db.execute('SELECT priority FROM outbox ORDER BY id DESC LIMIT 1').fetchone()[0], 0)
+            finally:
+                upgraded.db.close()
+
     def confirm_reset(self, uid=99, token=None, cancel=False):
         pending = self.store.get('clear_data:99')
         self.seq += 1

@@ -47,6 +47,8 @@ class PostgresConnection:
                 if statement.strip():
                     self.connection.execute(statement)
             self.connection.execute('CREATE TABLE IF NOT EXISTS worker_lease (id BIGINT PRIMARY KEY, owner TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL)')
+            self.connection.execute('ALTER TABLE outbox ADD COLUMN IF NOT EXISTS priority BIGINT NOT NULL DEFAULT 10')
+            self.connection.execute('CREATE INDEX IF NOT EXISTS outbox_ready ON outbox(state,priority,available_at,id)')
 
     def execute(self, sql, params=()):
         # Application SQL uses positional ? parameters, never user-supplied SQL.

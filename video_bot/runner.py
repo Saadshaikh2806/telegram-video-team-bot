@@ -4,6 +4,7 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import defaultdict, deque
 
 from .reports import build_report, recognition
 from .telegram import TelegramError
@@ -18,6 +19,21 @@ class Runner:
         self.chat_next = {}
         self.groups_checked = False
         self.admins_chat_checked = None
+        self.admins_refresh_at = 0
+        self.chat_retry_after = {}
+        self.chat_sent = defaultdict(deque)
+        self.next_tick = 0
+        self.next_lease_check = 0
+
+    def flush_callbacks(self):
+        rows = self.e.db.execute("SELECT * FROM outbox WHERE method='answerCallbackQuery' AND state='pending' AND available_at<=? ORDER BY id LIMIT 100", (self.e.clock(),)).fetchall()
+        for row in rows:
+            try:
+                self.deliver(row, json.loads(row['payload']))
+            except TelegramError as exc:
+                with self.e.db:
+                    self.e.db.execute('UPDATE outbox SET state=?,available_at=? WHERE id=?',
+                        ('skipped' if exc.code in (400, 403, 404) else 'pending', self.e.clock() + max(1, exc.retry_after), row['id']))
 
     def reconcile_groups(self):
         # Recover upgrades whose service messages arrived before this version.
@@ -43,23 +59,32 @@ class Runner:
         self.groups_checked = True
 
     def flush(self, limit=15):
+        self.flush_callbacks()
         now = self.e.clock()
-        rows = self.e.db.execute("SELECT * FROM outbox WHERE state='pending' AND available_at<=? ORDER BY id LIMIT 100", (now,)).fetchall()
+        rows = self.e.db.execute("SELECT * FROM outbox WHERE state='pending' AND method!='answerCallbackQuery' AND available_at<=? ORDER BY priority,id LIMIT 100", (now,)).fetchall()
         sent = 0
         blocked_chats = set()
         for row in rows:
             if sent >= limit:
                 break
+            if self.e.db.execute('SELECT state FROM outbox WHERE id=?', (row['id'],)).fetchone()[0] != 'pending':
+                continue
             payload = json.loads(row['payload'])
             chat = payload.get('chat_id', self.e.editors_chat if row['method'] == 'assignment' else 0)
-            if chat and (chat in blocked_chats or self.chat_next.get(chat, 0) > now):
+            recent = self.chat_sent[chat]
+            while recent and recent[0] <= now - 60:
+                recent.popleft()
+            paced_until = (recent[-1] + 1.05 if recent else 0) if row['priority'] <= 0 else self.chat_next.get(chat, 0)
+            if chat and (chat in blocked_chats or self.chat_retry_after.get(chat, 0) > now or paced_until > now or len(recent) >= 20):
                 blocked_chats.add(chat)
                 continue
             try:
-                self.deliver(row, payload)
-                sent += 1
-                if chat:
-                    self.chat_next[chat] = self.e.clock() + 3.1
+                delivered = self.deliver(row, payload)
+                if delivered:
+                    sent += 1
+                    if chat:
+                        self.chat_sent[chat].append(self.e.clock())
+                        self.chat_next[chat] = self.e.clock() + 3.1
             except TelegramError as exc:
                 if exc.migrate_to_chat_id and chat:
                     with self.e.db:
@@ -79,10 +104,19 @@ class Runner:
                 if chat:
                     blocked_chats.add(chat)
                     self.chat_next[chat] = now + delay
+                    self.chat_retry_after[chat] = now + delay
 
     def deliver(self, row, payload):
         e = self.e
         method = row['method']
+        delivered = True
+        ui_guard = payload.pop('_ui_guard', None)
+        if ui_guard:
+            current = e.db.execute('SELECT * FROM jobs WHERE id=?', (ui_guard['job'],)).fetchone()
+            if current is None or ui_guard['token'] != e.ui_token(current):
+                with e.db:
+                    e.db.execute("UPDATE outbox SET state='skipped' WHERE id=?", (row['id'],))
+                return False
         guard = payload.pop('_guard', None)
         if guard and not e.alert_valid(e.job(row['job_id']), guard):
             with e.db:
@@ -103,10 +137,13 @@ class Runner:
             elif method == 'ui_prompt':
                 key, request = payload.pop('key'), payload.pop('request')
                 pending = e.s.get(key)
-                if pending and pending['request'] == request:
+                job = e.db.execute('SELECT * FROM jobs WHERE id=?', (pending['job'],)).fetchone() if pending else None
+                if pending and pending['request'] == request and pending['expires'] > e.clock() and job and pending['token'] == e.ui_token(job):
                     result = self.api.call('sendMessage', **payload)
                     with e.db:
                         e.s.set(key, {**pending, 'message_id': result['message_id']})
+                else:
+                    delivered = False
             else:
                 job = e.job(row['job_id'])
                 params = e.ui_card(job)
@@ -117,6 +154,8 @@ class Runner:
                     result = self.update_text(params, saved['message_id'] if saved else None)
                     with e.db:
                         e.s.set(key, {'message_id': result['message_id'], 'token': token})
+                else:
+                    delivered = False
             with e.db:
                 e.db.execute("UPDATE outbox SET state='sent' WHERE id=?", (row['id'],))
         elif method == 'assignment':
@@ -136,6 +175,7 @@ class Runner:
                 e.assignment_delivered(job['id'], result['message_id'], now, due)
                 e.db.execute("UPDATE outbox SET state='sent' WHERE id=?", (row['id'],))
         elif method == 'report':
+            delivered = False
             start, end = payload['start'], payload['end']
             rows = e.report_rows(start, end)
             title = f'{datetime.fromtimestamp(start, e.c.tz):%d %b} – {datetime.fromtimestamp(end, e.c.tz) - timedelta(days=1):%d %b %Y} | {e.c.timezone}'
@@ -158,6 +198,8 @@ class Runner:
             with e.db:
                 e.db.execute("UPDATE outbox SET state='sent' WHERE id=?", (row['id'],))
 
+        return delivered
+
     def update_text(self, params, message_id=None):
         if message_id:
             try:
@@ -170,42 +212,52 @@ class Runner:
                     raise
         return self.api.call('sendMessage', **params)
 
-    def refresh_admins(self):
+    def refresh_admins(self, force=True):
+        if not force and self.admins_chat_checked == self.e.editors_chat and self.e.clock() < self.admins_refresh_at:
+            return
         if self.e.editors_chat:
             admins = self.api.call('getChatAdministrators', chat_id=self.e.editors_chat)
             with self.e.db:
                 self.e.set_group_admins((member['user']['id'] for member in admins), authoritative=True)
             self.admins_chat_checked = self.e.editors_chat
+            self.admins_refresh_at = self.e.clock() + 60
 
     def run(self, stop=None, health=None):
         import threading
         stop = stop or threading.Event()
         while not stop.is_set():
             try:
-                if not self.e.s.lease():
-                    if health:
-                        health.beat()
-                    stop.wait(5)
-                    continue
+                if self.e.clock() >= self.next_lease_check:
+                    if not self.e.s.lease():
+                        if health:
+                            health.beat()
+                        stop.wait(5)
+                        continue
+                    self.next_lease_check = self.e.clock() + 20
                 if not self.groups_checked:
                     self.reconcile_groups()
                 # Refresh before any registrations, reservations or deliveries.
                 # On API failure the loop retries without assigning from a stale list.
-                self.refresh_admins()
+                self.refresh_admins(force=False)
                 pending = self.e.db.execute("SELECT 1 FROM outbox WHERE state='pending' LIMIT 1").fetchone()
-                updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=2 if pending else 20,
+                updates = self.api.call('getUpdates', offset=self.e.s.get('offset', 0), timeout=0 if pending else 20,
                                         allowed_updates=['message', 'callback_query', 'chat_member'])
                 for update in updates:
                     self.e.handle(update)
+                    self.flush_callbacks()
                     if self.e.editors_chat and self.e.editors_chat != self.admins_chat_checked:
                         self.refresh_admins()
                 if any('chat_member' in update for update in updates):
                     # Historical events must not determine roles at delivery time.
                     self.refresh_admins()
-                self.e.tick()
+                if self.e.clock() >= self.next_tick:
+                    self.e.tick()
+                    self.next_tick = self.e.clock() + 1
                 self.flush()
                 if health:
                     health.beat()
+                if pending:
+                    stop.wait(0.15)
             except TelegramError as exc:
                 log.warning('Telegram unavailable (code %s). Will retry.', exc.code)
                 if exc.code in (401, 409):

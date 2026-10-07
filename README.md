@@ -15,6 +15,8 @@ The bot posts **Team controls** in the Editors group and attempts to pin it auto
 
 The five shareable poster images and combined PDF are in `output/pdf/`.
 
+Button acknowledgements use a dedicated delivery path. Interactive replies take priority over routine notifications, and pending output disables the extra long-poll wait. Interactive messages are spaced by at least 1.05 seconds, with a shared limit of 20 group deliveries per minute and Telegram retry-after backoff. Routine notifications retain wider spacing. Current administrator lists are cached for up to 60 seconds and refreshed immediately for membership changes. Status refreshes touch changed jobs rather than the full job history, and superseded updates are collapsed. Existing SQLite and PostgreSQL databases gain the queue priority field automatically.
+
 ### Start fresh
 
 An admin can send **`/clear_all_data`** in the Editors group, review the totals, then tap **Yes, clear all bot data**. The confirmation belongs to that admin, expires after 10 minutes, and is rejected if job/editor/history counts change. **Keep my data** cancels it.

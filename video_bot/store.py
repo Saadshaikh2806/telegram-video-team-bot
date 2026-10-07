@@ -2,6 +2,7 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -32,7 +33,7 @@ CREATE TABLE IF NOT EXISTS processed_updates (id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS outbox (
  id INTEGER PRIMARY KEY, dedupe TEXT UNIQUE, method TEXT NOT NULL, payload TEXT NOT NULL,
  job_id INTEGER, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
- available_at REAL NOT NULL DEFAULT 0, last_error TEXT
+ available_at REAL NOT NULL DEFAULT 0, last_error TEXT, priority INTEGER NOT NULL DEFAULT 10
 );
 '''
 
@@ -41,6 +42,8 @@ class Store:
     def __init__(self, path, database_url=''):
         self.owner = uuid.uuid4().hex
         self.remote = bool(database_url)
+        self.priority = 10
+        self.changed_jobs = set()
         if self.remote:
             from .postgres import PostgresConnection
             self.db = PostgresConnection(database_url, SCHEMA)
@@ -50,6 +53,18 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        if 'priority' not in [row[1] for row in self.db.execute('PRAGMA table_info(outbox)')]:
+            self.db.execute('ALTER TABLE outbox ADD COLUMN priority INTEGER NOT NULL DEFAULT 10')
+        self.db.execute('CREATE INDEX IF NOT EXISTS outbox_ready ON outbox(state,priority,available_at,id)')
+
+    @contextmanager
+    def prioritized(self, priority):
+        previous = self.priority
+        self.priority = priority
+        try:
+            yield
+        finally:
+            self.priority = previous
 
     def get(self, key, default=None):
         row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -59,10 +74,13 @@ class Store:
         self.db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value)))
 
     def enqueue(self, method, payload, dedupe=None, job=None):
-        self.db.execute('INSERT INTO outbox(dedupe,method,payload,job_id) VALUES (?,?,?,?) ON CONFLICT(dedupe) DO NOTHING',
-                        (dedupe, method, json.dumps(payload), job))
+        priority = -10 if method == 'answerCallbackQuery' else min(self.priority, 0 if method in ('ui_prompt', 'editMessageText', 'editMessageReplyMarkup') else 10)
+        self.db.execute('INSERT INTO outbox(dedupe,method,payload,job_id,priority) VALUES (?,?,?,?,?) ON CONFLICT(dedupe) DO NOTHING',
+                        (dedupe, method, json.dumps(payload), job, priority))
 
     def event(self, job, actor, kind, details, now):
+        if job is not None:
+            self.changed_jobs.add(job)
         self.db.execute('INSERT INTO events(job_id,actor,kind,details,at) VALUES (?,?,?,?,?)',
                         (job, actor, kind, details, now))
 

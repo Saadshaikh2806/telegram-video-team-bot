@@ -76,12 +76,21 @@ class ButtonUI:
         if not self.editors_chat:
             return
         self.ui_ensure_menu()
-        for job in self.db.execute("SELECT * FROM jobs WHERE status NOT IN ('approved','cancelled') OR id IN (SELECT job_id FROM outbox WHERE method='ui_card')").fetchall():
+        changed = set(self.s.changed_jobs)
+        if getattr(self, '_ui_loaded_chat', None) != self.editors_chat:
+            changed.update(row[0] for row in self.db.execute("SELECT id FROM jobs WHERE status NOT IN ('approved','cancelled')").fetchall())
+            self._ui_loaded_chat = self.editors_chat
+        for jid in changed:
+            job = self.db.execute('SELECT * FROM jobs WHERE id=?', (jid,)).fetchone()
+            if job is None:
+                continue
             key = f'ui_card_token:{self.editors_chat}:{job["id"]}'
             token = self.ui_render_token(job)
             if self.s.get(key) != token:
+                self.db.execute("UPDATE outbox SET state='skipped' WHERE method='ui_card' AND job_id=? AND state='pending'", (jid,))
                 self.s.enqueue('ui_card', {'chat_id': self.editors_chat}, job=job['id'])
                 self.s.set(key, token)
+        self.s.changed_jobs.difference_update(changed)
 
     def ui_callback(self, cb):
         from .engine import UserError
@@ -141,7 +150,9 @@ class ButtonUI:
             message_id = cb['message']['message_id']
             if message_id not in (job['card_id'], saved.get('message_id')):
                 # Task-list copies should also advance instead of keeping Start editing.
-                self.s.enqueue('editMessageText', {'message_id': message_id, **self.ui_card(self.job(number))})
+                current = self.job(number)
+                self.s.enqueue('editMessageText', {'message_id': message_id, **self.ui_card(current),
+                    '_ui_guard': {'job': number, 'token': self.ui_token(current)}}, job=number)
         elif action == 'approve':
             self.approve(job, uid)
         elif action in ('submit', 'block', 'revise', 'unassign', 'extend', 'cancel'):
@@ -150,11 +161,15 @@ class ButtonUI:
                          'extend': 'How many extra hours? Reply with a number from 1 to 168, followed by the reason.',
                          'cancel': 'Why cancel this video? Reply with the reason to confirm cancellation.'}
             key = f'ui_prompt:{chat}:{uid}'
+            previous = self.s.get(key)
+            existing_prompt = self.db.execute('SELECT state FROM outbox WHERE dedupe=?', (f'prompt:{previous["request"]}',)).fetchone() if previous else None
+            if previous and previous['action'] == action and previous['job'] == number and previous['token'] == parts[3] and previous['expires'] > self.clock() and (previous.get('message_id') or (existing_prompt and existing_prompt[0] == 'pending')):
+                return  # Repeated taps must not invalidate the question already sent.
             pending = {'action': action, 'job': number, 'token': parts[3], 'expires': self.clock() + 3600, 'request': cb['id']}
             self.s.set(key, pending)
             self.s.enqueue('ui_prompt', {'chat_id': chat, 'key': key, 'request': cb['id'],
                 'text': f'<a href="tg://user?id={uid}">{html.escape(cb["from"].get("first_name", "Team member"))}</a> · VID-{number:04d}\n{questions[action]}\nReply “Never mind” to stop.',
-                'parse_mode': 'HTML', 'reply_markup': {'force_reply': True, 'selective': True}})
+                'parse_mode': 'HTML', 'reply_markup': {'force_reply': True, 'selective': True}}, f'prompt:{cb["id"]}')
         else:
             raise UserError('Unknown button. Open Team controls.')
 

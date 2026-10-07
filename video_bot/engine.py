@@ -137,13 +137,15 @@ class Engine(ButtonUI):
             raise UserError('Only the assigned editor can do that.')
 
     def handle(self, update):
-        with self.db:
+        interactive = bool(update.get('callback_query') or update.get('message', {}).get('reply_to_message'))
+        with self.s.prioritized(0 if interactive else 10), self.db:
             self.s.begin_write()
             if self.db.execute('SELECT 1 FROM processed_updates WHERE id=?', (update['update_id'],)).fetchone():
                 return
             self.db.execute('SAVEPOINT incoming')
             msg = update.get('message')
             cb = update.get('callback_query')
+            callback_error = None
             if cb:
                 msg = cb.get('message')
             try:
@@ -155,11 +157,14 @@ class Engine(ButtonUI):
                     self.message(msg)
             except (UserError, ValueError, IndexError) as exc:
                 self.db.execute('ROLLBACK TO incoming')
-                if msg:
+                if cb:
+                    callback_error = str(exc) if isinstance(exc, UserError) else 'Invalid button. Open Team controls.'
+                elif msg:
                     self.say(msg['chat']['id'], html.escape(str(exc) if isinstance(exc, UserError) else 'Invalid command. Send /help for examples.'))
             self.db.execute('RELEASE incoming')
             if cb:
-                self.s.enqueue('answerCallbackQuery', {'callback_query_id': cb['id']})
+                self.s.enqueue('answerCallbackQuery', {'callback_query_id': cb['id'],
+                    **({'text': callback_error[:200], 'show_alert': True} if callback_error else {})})
             self.db.execute('INSERT INTO processed_updates VALUES (?)', (update['update_id'],))
             self.s.set('offset', update['update_id'] + 1)
             self.assign()

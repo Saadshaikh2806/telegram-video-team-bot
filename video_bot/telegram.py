@@ -70,7 +70,7 @@ class Telegram:
             content_type = 'application/json'
         try:
             req = Request(self.base + method, data=body, headers={'Content-Type': content_type})
-            with urlopen(req, timeout=40) as response:
+            with urlopen(req, timeout=5 if method == 'answerCallbackQuery' else 40) as response:
                 result = json.load(response)
         except HTTPError as exc:
             try:
